@@ -2,7 +2,19 @@
   "permissions": {
     "allow": [
       "Bash(powershell -Command \"Get-ChildItem -Path 'C:\\\\Users\\\\Stefan.Bramer' -Recurse -Include 'Godot*.exe' -ErrorAction SilentlyContinue -Depth 6 | Select-Object FullName\")",
-      "Bash(/c/Users/Stefan.Bramer/HOME/PROJECTS/CODING/Godot_v4.4.1-stable_win64_console.exe *)"
+      "Bash(/c/Users/Stefan.Bramer/HOME/PROJECTS/CODING/Godot_v4.4.1-stable_win64_console.exe *)",
+      "Bash(echo \"EXIT_CODE=$?\")",
+      "Bash(echo \"PROJECT_LOAD_EXIT=$?\")",
+      "Bash(echo \"TESTS_EXIT=$?\")",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(echo \"PROJECT_EXIT=$?\")",
+      "WebFetch(domain:docs.godotengine.org)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(\"/c/Program Files/Godot/Godot_v4.4.1-stable_win64_console.exe\" --headless --script res://tests/run_tests.gd)",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(python3 -I -c ' *)"
     ]
   }
 }

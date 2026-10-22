@@ -1,3 +1,28 @@
 # Godot 4+ specific ignores
 .godot/
 /android/
+
+# Godot export artifacts (no export presets configured yet, but harmless to
+# pre-empt -- these are build output, never source)
+/builds/
+*.pck
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editor folders (not currently used, but regenerated per-machine if someone
+# does use one -- not project config worth sharing)
+.vscode/
+.idea/
+
+# Claude Code: machine/session-local, not shared project config.
+# settings.local.json holds this machine's own tool-permission grants;
+# scheduled_tasks.lock is a live PID/session lock file, never meaningful
+# to commit. (settings.local.json is already tracked from the initial
+# commit -- `git rm --cached .claude/settings.local.json` once if you
+# want it actually untracked, this alone only stops future changes.)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+/art/simupak64-124-3/

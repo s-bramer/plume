@@ -1,0 +1,69 @@
+[gd_scene load_steps=10 format=3 uid="uid://cjv7a7netixmc"]
+
+[ext_resource type="Script" uid="uid://donegcepge4p7" path="res://scripts/rendering/camera_zoom.gd" id="1"]
+[ext_resource type="Script" uid="uid://cvi32e3amvefu" path="res://scripts/rendering/world.gd" id="2"]
+[ext_resource type="Script" uid="uid://ckp8il7ynpyhw" path="res://scripts/rendering/hex_debug_overlay.gd" id="3"]
+[ext_resource type="Script" uid="uid://b326xmdku46rp" path="res://scripts/rendering/grid_outline.gd" id="4"]
+[ext_resource type="Script" uid="uid://c6ohpq6tc71ic" path="res://scripts/rendering/hex_selection.gd" id="5"]
+[ext_resource type="Script" uid="uid://c5cum40xi7rjm" path="res://scripts/rendering/flow_overlay.gd" id="6"]
+[ext_resource type="Script" uid="uid://044o3130i648" path="res://scripts/rendering/plume_overlay.gd" id="7"]
+[ext_resource type="Script" path="res://scripts/rendering/geology_overlay.gd" id="8"]
+[ext_resource type="Script" uid="uid://dweufg21qp4c5" path="res://scripts/rendering/head_contour_overlay.gd" id="9"]
+
+[node name="Main" type="Node2D"]
+script = ExtResource("2")
+radius = 10
+show_debug_overlay = false
+show_flow_overlay = false
+source_axial = Vector2i(-1, -4)
+source_leak_rate_kg_s = 0.0001
+well_axial = Vector2i(-7, 3)
+well_pumping_rate_m3_s = 0.05
+receptor_axial = Vector2i(-5, 5)
+receptor_contamination_threshold_kg_m3 = 0.001
+max_turns = 100
+contamination_full_scale_kg_m3 = 0.02
+minimal_test_mode = false
+tree_visual_nudge = Vector2(0, 10)
+decal_density = 0.088
+decal_scatter_radius = 21.047
+feature_scatter_radius = 17.902
+tile_shading_strength = 0.324
+tile_tint_jitter = 0.048
+
+[node name="Ground" type="TileMapLayer" parent="."]
+
+[node name="GridOutline" type="Node2D" parent="."]
+script = ExtResource("4")
+shore_line_color = Color(0.139094, 0.131455, 0.528343, 1)
+shore_line_width = 7.0
+
+[node name="Features" type="Node2D" parent="."]
+y_sort_enabled = true
+
+[node name="DebugOverlay" type="Node2D" parent="."]
+script = ExtResource("3")
+
+[node name="GeologyOverlay" type="Node2D" parent="."]
+script = ExtResource("8")
+
+[node name="HeadContourOverlay" type="Node2D" parent="."]
+script = ExtResource("9")
+label_min_spacing_px = 390.4
+
+[node name="PlumeOverlay" type="Node2D" parent="."]
+script = ExtResource("7")
+opacity = 1.0
+smoothing_iterations = 4
+min_region_area_px2 = 2000.0
+
+[node name="FlowOverlay" type="Node2D" parent="."]
+script = ExtResource("6")
+
+[node name="HexSelection" type="Node2D" parent="."]
+script = ExtResource("5")
+
+[node name="Camera2D" type="Camera2D" parent="."]
+zoom = Vector2(1.5, 1.5)
+script = ExtResource("1")
+max_zoom = 10.0

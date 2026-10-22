@@ -4,13 +4,9 @@
 
 ## 1. Elevator pitch
 
-**Plume: Darcy's Curse** is a turn-based, 2D pixel-art strategy/puzzle game. The player is an environmental engineer/hydrogeologist racing to characterize, contain and remediate a contaminant plume before it reaches a vulnerable receptor — in the flagship scenario, a family farm's drinking-water well at the bottom of the map. The plume itself is not a second player; it's an unforgiving physical process that keeps migrating according to real geology, groundwater hydraulics and contaminant chemistry whether or not anyone is fighting it.
+**Plume: Darcy's Curse** is a turn-based, 2D pixel-art strategy/puzzle game where the player embodies a groundwater contaminant plume. The plume migrates according to geology, groundwater hydraulics and contaminant chemistry. The player makes constrained strategic choices while an environmental-engineering opponent attempts to investigate, contain and remediate the contamination.
 
-**Design pillar 1:** *Physics creates the puzzle.* Players should learn hydrogeology through visible cause and effect — watching a capture zone actually intercept a plume, watching a PRB actually run out of reactive capacity — rather than through quizzes or arbitrary "remediation power" buttons.
-
-**Design pillar 2:** *A landscape worth protecting.* This is an environmental game, and the farm, the stream, the fields above the aquifer need to be genuinely lovely — the kind of place a player feels something about losing — not a diagram with sprites on it. Most educational games fail here; this one shouldn't. See §6 for how that bar is met without burying the science underneath it.
-
-> **Revision note (2026-10-13):** earlier drafts had the player *embody* the plume, with an AI engineer as the opponent. That's retired as the primary mode — see §12 for the reasoning — but the asymmetric "play as the plume" idea is preserved as a possible later mode (§5), since the simulation core underneath is identical either way. A second revision (§12) elevates visual/audio quality from a Phase 3 afterthought to a first-class pillar, with its own tooling plan and an early, deliberately time-boxed "look-and-feel spike" ahead of Phase 1.
+**Design pillar:** *Physics creates the puzzle.* Players should learn hydrogeology through visible cause and effect, rather than through quizzes or arbitrary movement powers.
 
 ## 2. Audience and experience
 
@@ -21,15 +17,15 @@
 
 ## 3. Gameplay loop
 
-1. **Characterize:** Spend budget/turns on monitoring wells, soil borings or geophysics to reveal geology, heads and concentrations that start hidden. The subsurface is fog-of-war by default — you only know what you've measured, same as a real site investigation.
-2. **Plan:** Choose one remediation/control action within budget (a pump-and-treat well, a PRB, a bioremediation injection, monitored natural attenuation) — or choose to invest this turn in more characterization instead of action. Actions must respect the contaminant's and the site's actual properties.
-3. **Hydraulic update:** Rainfall/recharge, pumping (yours, and any background pumping already on the map), boundary conditions and geological heterogeneity determine heads and intercell water fluxes.
-4. **Transport/reactions:** Mass migrates by advection/dispersion and may sorb, desorb, degrade or transform according to the scenario — the plume keeps moving on its own physics regardless of what the player chose.
-5. **Receptor check:** Evaluate concentration/exposure at the receptor against its threshold.
-6. **Feedback:** Animate the plume and update mass balance, concentration map, flow arrows, objectives and a brief explanation of *why* it moved (and why a remedy did or didn't work).
-7. **Repeat** until the receptor is protected (win) or its exposure threshold is exceeded, or the budget/turn limit runs out with risk unresolved (loss).
+1. **Inspect:** View geological units, hydraulic heads/gradients, contaminant distribution and vulnerable receptors.
+2. **Plan:** Choose one limited plume-side action or strategy (e.g. exploit a pathway, time a release from a sorbed reservoir, or select a source release schedule where scenario rules permit). Actions must respect the contaminant's actual properties and environmental conditions.
+3. **Hydraulic update:** Rainfall/recharge, pumping, boundary conditions and geological heterogeneity determine heads and intercell water fluxes.
+4. **Transport/reactions:** Mass migrates by advection/dispersion and may sorb, desorb, degrade or transform according to the scenario.
+5. **Engineer response:** AI (later potentially another player) investigates and deploys monitoring, pumping or treatment within a budget.
+6. **Feedback:** Animate the plume and update mass balance, concentration map, flow arrows, objectives and a brief explanation of *why* it moved.
+7. **Repeat** until the receptor-risk or remediation objective is resolved.
 
-The player **does not get a magic "clean now" button**, and can't freely steer contamination or change intrinsic chemical properties. Every remediation action only works to the extent its own physics allow: a pumping well only captures the plume if it's positioned and pumped to generate adequate capture; a PRB only works if the contaminant's residence time in the barrier is long enough for the reaction; monitored natural attenuation only works if degradation/dilution genuinely outpaces the plume's advance. A poorly chosen action should visibly fail, not just under-perform. For the first prototype, a temporary 'instant capture' mechanic can be used to test fun, but should ultimately be replaced by a defensible capture-zone calculation (e.g. pumping rate vs. ambient gradient and conductance).
+The player **does not steer contamination freely** or magically change intrinsic chemical properties. Strategic actions should modify physically defensible controls or choose among feasible pathways. For the first prototype, a temporary 'boost flow' mechanic can be used to test fun, but should ultimately be replaced by a defensible scenario action (e.g. changing a permitted source-release rate or exploiting an existing pumping/recharge event).
 
 ## 4. Core systems
 
@@ -59,7 +55,7 @@ Hydraulic head is a dynamic state variable, not an immutable geological property
 
 ### Groundwater flow
 
-- MVP: imposed linear head gradient with heterogeneous `K`; compute face fluxes from head differences and conductance.
+- MVP: impose boundary heads and solve for internally consistent heads when `K` is heterogeneous; a prescribed linear head field is valid as a simple uniform-`K` benchmark, but generally does not conserve water across heterogeneous cells.
 - Next: solve a conservative steady-state groundwater-flow balance with fixed-head/no-flow boundaries, recharge and well sinks/sources.
 - Darcy flux `q = -K ∇h`; pore-water velocity approximately `v = q / n_e`.
 - Recharge influences heads and flow only through an appropriate water-balance/boundary formulation, not by directly 'pushing' all contaminants one tile.
@@ -85,12 +81,11 @@ Hydraulic head is a dynamic state variable, not an immutable geological property
 | Arsenic | Geochemically controlled mobilization | Redox/pH and mineral interactions are critical |
 | Microbial pathogens | Filtration/attachment and inactivation | Survival and transport vary greatly with conditions |
 
-**MVP contaminant: nitrate as a conservative tracer first**, then introduce plausible denitrification as an advanced scenario. Do not start with multiphase NAPL.
+**MVP: a synthetic conservative dissolved tracer first** (no sorption or reactions). Add nitrate as a separate scenario with redox-dependent denitrification later. Do not start with multiphase NAPL.
 
-### Player tools: characterization and remediation
+### Engineer defenses
 
-- Soil borings / geophysics: reveal geology and K at a location, at a one-time cost. Primary way to lift fog-of-war on the subsurface before committing to a remedy.
-- Monitoring wells: reveal concentrations at selected locations/depths, repeatedly over time (ongoing cost, not one-time).
+- Monitoring wells: reveal concentrations at selected locations/depths.
 - Pump-and-treat wells: alter hydraulic gradients and extract dissolved mass; capacity/cost constraints.
 - Permeable reactive barriers: allow flow while reacting with appropriate contaminants, subject to residence time and capacity.
 - Bioremediation: change suitable geochemical conditions, with potential byproducts.
@@ -101,21 +96,15 @@ Hydraulic head is a dynamic state variable, not an immutable geological property
 
 ## 5. Objectives and strategy
 
-- **Player (engineer) objective:** protect the receptor — keep exposure below its defined threshold (drinking-water supply, river, wetland) — within budget and turn limits, while characterizing and remediating a plume that doesn't wait for you.
-- **The plume is not played directly** in the core mode. It's governed by the scenario's geology/chemistry and, optionally, an uncertain or evolving source term (a tank that keeps leaking at an unknown rate, a seasonal recharge pulse, a neighbor's well shifting the gradient) — this keeps the "opponent" genuinely threatening without needing a smart adversarial AI.
-- Scoring: receptor risk avoided, remediation cost, elapsed time/turns, remaining mass, characterization efficiency (information gained per dollar spent), and a scientific explanation/learning summary at the end of each scenario.
-- Later: scenario campaigns, varied receptor types (public supply well, stream, wetland) with different thresholds, and an asymmetric local-multiplayer / "hard mode" that revives the original embody-the-plume idea — one player chooses source characteristics or release timing within realistic constraints, the other plays engineer — built on the same shared simulation core rather than a separate game.
+- Pollutant objective: reach a sensitive receptor (drinking-water supply, river, wetland) above a defined concentration/exposure threshold within a turn limit.
+- Engineer objective: protect receptors and reduce/control the plume within budget and time constraints.
+- Scoring: receptor risk, remediation cost, elapsed time, remaining mass, and scientific explanation/learning achievements.
+- Later: asymmetric local multiplayer, scenario campaigns and optional 'engineer mode'.
 
 ## 6. Visual direction and UX
 
-**The landscape is content, not chrome.** The surface world — the farm, its fields, the stream, the tree line — should read as a real, lived-in place the player grows attached to, well before any overlay is switched on. Budget actual art-direction effort here; don't treat it as a skin applied once the systems work.
-
-- **2D pixel art**, pointy-top hexes, dark aquifer blue `#0D1B2A`, toxic green `#9FE870`, sandy beige `#E6D2A3`, rust red `#B34040`, vapor grey `#C5C6C7`. Reserve the saturated colors (toxic green, rust red) for contamination and alerts; keep the healthy landscape itself in warmer, calmer, slightly desaturated tones so the palette alone tells you when something's wrong.
-- **Autotiled terrain.** Use Godot's terrain sets on `TileMapLayer` so geology types blend with transition tiles at their edges rather than snapping hard — hard edges read as a spreadsheet, blended edges read as a place. Budget base + edge-transition art per geology type, not just one tile per type.
-- **The hardest visual problem in the brief: pretty art and legible data overlays fighting each other.** A detailed, busy hand-painted tile makes a semi-transparent concentration heatmap or contour line murky; a flat, calm tile lets the overlay read instantly. Resolve this by design, not by accident: keep the base terrain's value range and detail relatively restrained, and let overlays (heatmap, contours, flow arrows, well influence) carry the high-contrast, high-saturation information layer on top. Treat this specific risk as the first thing to test (§8, Phase 0), because it's the one thing hardest to fix after dozens of tiles already exist.
-- **Ambient life, separate from data.** Idle animation (grass sway, water glint, birds, drifting dust/pollen) should run continuously and read as "alive," independent of simulation state — it's mood, not information, and should never be mistaken for a flow arrow or concentration cue.
-- **Interaction feel.** Placing a well/PRB/monitoring point is a core, repeated verb — treat it like a AAA city-builder would: hover shows a ghost preview (and whether the placement is even valid), click confirms with a short, satisfying settle animation plus a sound cue, and a brief particle/ripple sells that something real just happened in the world. Removing or disabling a tool should feel just as deliberate, not an instant delete.
-- **Sound as a second channel for information.** A quiet ambient bed (wind, water, birdsong) carries the "healthy farm" feeling; discrete SFX mark actions (placing a well, a borehole sample coming back, a remedy activating); a subtle, non-alarming audio shift near the receptor as risk rises keeps tension legible even when a player isn't staring at the numbers. Keep it tasteful — an "environmental" game shouldn't sound like a casino.
+- **2D pixel art**, pointy-top hexes, dark aquifer blue `#0D1B2A`, toxic green `#9FE870`, sandy beige `#E6D2A3`, rust red `#B34040`, vapor grey `#C5C6C7`.
+- Pixel-art terrain and geological patterns; concentration heatmap overlays; animated flow arrows and well influence.
 - Godot 2D lights/shadows for mood, but never obscure critical simulation information.
 - Rain particles, surface wetness and recharge pulse indicators. Rainfall affects recharge according to a scenario water budget, not one-to-one.
 - Later: plan-view layer selector, vertical depth ruler, draggable A–A′ cross-section, per-cell inspector and mass-balance panel.
@@ -164,42 +153,17 @@ PlumeDarcy/
 
 Keep the architecture modest until the first playable build. Use typed GDScript where practical and stable data formats for scenarios.
 
-### Art, animation and audio tooling
-
-All native to Godot 4 or free/cheap and widely used by solo devs — nothing exotic needed:
-
-- **Pixel art authoring:** Aseprite (small one-time cost, industry-standard for pixel art + sprite-sheet animation, palette-lock and tile-aware, exports formats Godot imports cleanly). Worth owning if any meaningful amount of custom art is planned.
-- **Terrain/autotiling:** Godot's built-in `TileMapLayer` terrain sets handle the edge-blending described in §6 natively — no plugin needed.
-- **Animation/"juice":** `Tween` for procedural easing (hover ghosts, placement pop-and-settle, UI counters ticking); `AnimationPlayer` for sprite-sheet-driven ambient loops (grass sway, water glint); `GPUParticles2D` for ripples, dust, rain, contamination shimmer — all built in.
-- **Overlay rendering:** a `canvas_item` (2D) fragment shader is the right tool for blending a heatmap/contour layer over terrain without baking it into tile art — approachable even with minimal shader experience, and it's the piece most worth prototyping first (§8, Phase 0).
-- **UI:** Godot `Theme` resources for consistent, polished controls (buttons, tooltips, panels) without hand-styling each one.
-- **Asset sourcing, so art doesn't block systems work:** Kenney.nl (CC0, free, very usable for prototyping and often good enough to ship with restyling) and itch.io's pixel-art asset marketplace (many affordable, cohesive farm/nature tilesets from dedicated pixel artists) are worth testing against *before* committing to fully custom art — see Phase 0. freesound.org and Kenney's audio packs cover CC0 SFX; loop-friendly ambient music is easy to find on itch.io or under Creative Commons (e.g. incompetech). Commission a custom tileset later, once the art direction is locked by the spike, not before.
-- **Hex grid math reference:** Red Blob Games' "Hexagonal Grids" guide is the standard reference for axial/offset coordinates, neighbors and world-space conversion if §7's coordinate convention needs a refresher.
-
-**Honest complexity note:** hitting all of §6's bar — lovely landscape, legible overlays on top of it, smooth interaction feel, layered sound — is realistically **comparable in effort to the simulation engine itself**, not a coat of paint applied afterward. Many shipped indie games spend the majority of total development time in exactly this category even when their systems are simple. That's not a reason not to do it — it's the brief's second design pillar now — but it should be budgeted as real scope, not squeezed into Phase 3/4 as originally drafted.
-
 ## 8. Development roadmap
-
-### Phase 0 — Look-and-feel spike (time-boxed; recommended before Phase 1 systems work)
-
-A deliberately small, disposable-if-needed prototype whose only job is to retire the biggest *unknowns* about the visual pillar before any simulation work or large art investment — not an open-ended sandbox to keep adding to, since that risks consuming the whole project with no definition of done. Time-box it (days, not weeks) and stop once these four questions are answered:
-
-1. **Overlay legibility:** does a semi-transparent concentration heatmap/contour line actually read clearly over a candidate pixel-art terrain style, using real-shaped synthetic data (not a placeholder gradient)? This is the single highest-risk item in §6 — test it before producing a full tileset around a style that might not support it.
-2. **Interaction feel:** build the hover-ghost → click-confirm → settle-animation → sound loop for placing one thing (a well). If this one verb doesn't feel good, nothing built on top of it will.
-3. **Tile budget:** with autotiling, how many unique tiles/variants does a convincing landscape actually need? This sets a realistic art budget before committing to hand-drawing everything.
-4. **Style source:** test 1–2 candidate off-the-shelf tilesets/palettes (Kenney, itch.io) against questions 1–3 before deciding whether to hand-draw custom art or reskin a purchased set.
-
-Answering "yes, cleanly" on (1) in particular should gate whether Phase 1's gray-box prototype can carry already-charming (if not final) art, rather than true placeholder boxes — worth doing, since redoing a tileset after dozens of tiles exist is expensive, and your instinct that look-and-feel is crucial enough to test early is right. The risk in a sandbox isn't testing early, it's testing *without a stopping condition* — these four questions are that stopping condition.
 
 ### Phase 1 — Gray-box playable prototype (target: 2–3 weeks, flexible)
 
 1. Confirm Godot version, scene tree and existing hex TileSet; avoid rebuilding assets that already work.
 2. Generate or register a small hex map (radius ~8), with click/hover and correct coordinate conversion.
 3. Create data-backed cells with `K`, effective porosity, elevation and hydraulic head; visualize geology/head on the grid.
-4. Prescribe a simple head gradient and compute face fluxes using Darcy's law.
+4. Validate face fluxes with a uniform-`K` linear-head benchmark; when introducing heterogeneous `K`, solve a conservative steady-state head balance with specified boundary conditions.
 5. Seed a finite contaminant mass in one or more cells; implement conservative, one-layer, advection-only transport.
 6. Add Next Turn (Space), turn counter, concentration overlay, mass-balance display and reset.
-7. Add one physically defensible player remediation choice (e.g. a capture well with specified pumping rate) and one source behavior that keeps threatening the receptor without player input (e.g. a continuing release from the source).
+7. Add one physically defensible player choice and one simple engineer response (e.g. a capture well with specified pumping rate).
 8. Add a receptor target, win/loss rules and a short on-screen explanation of each turn.
 9. Write tests for zero-gradient transport, uniform gradient direction, mass conservation, nonnegative concentrations and boundary handling.
 
@@ -207,7 +171,7 @@ Answering "yes, cleanly" on (1) in particular should gate whether Phase 1's gray
 
 ### Phase 2 — Scientific depth and strategy
 
-- Heterogeneous geology; solved steady-state heads; recharge and pumping; dispersion; sorption; simple reactions; monitoring and PRBs; scenario configuration; AI response.
+- Heterogeneous geology; solved steady-state heads; recharge and pumping; longitudinal/transverse dispersion and molecular diffusion; sorption; simple reactions; monitoring and PRBs; scenario configuration; AI response.
 - Validate against simple analytical or benchmark cases before balancing for fun.
 
 ### Phase 3 — Vertical hydrogeology and presentation
@@ -232,8 +196,6 @@ Answering "yes, cleanly" on (1) in particular should gate whether Phase 1's gray
 5. **Build one playable scenario before adding chemistry, vertical layers or weather VFX.**
 6. **Make the reason visible.** Show gradients, geological barriers, source/sink terms and a clear before/after.
 7. **Do not equate a plume front with one tile per turn.** Transport follows fluxes and concentration/mass.
-8. **Remediation is not an "I win" button.** Every defense (well, PRB, MNA) only works to the extent its own physics allow — a poorly placed or underpowered capture well should visibly do nothing, not just underperform.
-9. **Information has a price.** Keep real geology, heads and concentration partially hidden until the player characterizes the site. Spending budget on investigation vs. action is itself the core strategic trade-off, and it mirrors how real site investigations are scoped.
 
 ## 10. Instructions for Claude Code
 
@@ -251,27 +213,104 @@ When working in this repository:
 
 **Suggested first prompt:**
 
-> Read `PLUME_PROJECT_BRIEF.md` (player is the engineer protecting the receptor, not the plume), inspect my current Godot project and tell me which Phase 1 requirements are already implemented. Then propose the next three small tasks. Implement only the first task after explaining the planned files and acceptance test. Preserve my existing hex TileSet and scene setup.
+> Read `PLUME_PROJECT_BRIEF.md`, inspect my current Godot project and tell me which Phase 1 requirements are already implemented. Then propose the next three small tasks. Implement only the first task after explaining the planned files and acceptance test. Preserve my existing hex TileSet and scene setup.
+
+
+## 12. Scientific transport specification (priority: high)
+
+**Non-negotiable:** Educational realism is a core game mechanic. The numerical model must represent physically meaningful processes, distinguish conceptual simplifications from established physics, and be verified before visual/gameplay polish.
+
+### 12.1 Groundwater hydraulics
+
+- **Darcy flow:** `q = -K ∇h` (specific discharge, m/s); in anisotropic media `K` is a tensor.
+- **Pore-water velocity:** `v = q / n_e` for saturated mobile pore space; do not confuse Darcy flux with advective velocity.
+- **Conservative cell water balance:** compute **one shared volumetric flux per cell face** using face conductance, geometry and head difference. Adjacent cells receive equal/opposite fluxes.
+- **Boundary conditions:** fixed head, no-flow, and specified flux; wells are volumetric sources/sinks, not blocking tiles.
+- **Recharge/discharge:** rainfall must be converted into effective recharge by a water-budget assumption, then applied as a flow source/boundary flux; rivers can gain or lose water depending on stage/head.
+- **Heterogeneity:** different K values create preferential flow and deflection; do not assume an arbitrary imposed linear head field remains a solution for heterogeneous K.
+- **Transient flow (later):** storage and specific yield/specific storage, evolving water table, pumping/recovery, seasonal recharge; confined head is not automatically water-table elevation.
+- **Vertical flow (later):** stratigraphic layers, anisotropy, vertical conductance, well screens and leakage.
+
+### 12.2 Transport processes, in implementation order
+
+| Process | Governing idea | First implementation | Critical caveat |
+|---|---|---|---|
+| Advection | Solute mass carried by volumetric groundwater flux | Conservative upwind flux across each hex face | Use **water flux × upwind aqueous concentration**, not arbitrary tile jumps |
+| Mechanical dispersion | Velocity variability causes spreading | Longitudinal and transverse tensor projected onto each face | Dispersivity is scale dependent; numerical dispersion is not physical dispersion |
+| Molecular diffusion | Movement down concentration gradients | Effective pore-water diffusion, including at zero flow | Tortuosity and porosity matter |
+| Equilibrium sorption / retardation | Mass partitions between water and solid | `R_f = 1 + rho_b * Kd / n` for linear equilibrium sorption | `Kd` depends on **species and sediment**; don't double-count sorbed mass |
+| Kinetic sorption / desorption | Slow release from sorbed reservoirs | Separate dissolved and sorbed mass compartments | Important for tailing and rebound |
+| Biodegradation / abiotic reaction | Transformation or removal depends on chemistry | Explicit species-specific rate and products | Track daughter products; mass of each compound is not conserved across transformation, but constituent mass should be accounted for |
+| Source dissolution | NAPL/solid source replenishes dissolved plume | Boundary/source term with finite source inventory | Pure-phase NAPL migration is a separate, advanced model |
+| Volatilisation / gas transport | Partitioning into soil gas | Add only with a vadose-zone/gas model | Never teleport dissolved mass across tiles |
+| Matrix diffusion / back-diffusion | Storage in low-K zones and later release | Dual-domain exchange or resolved low-K cells | Major driver of long-term persistence |
+| Geochemical speciation | pH/redox affect form, mobility, reactions | Scenario-specific reaction networks | Needed for arsenic/metals, not universal simple decay |
+| Density-dependent and multiphase flow | Brines and free-phase LNAPL/DNAPL | Advanced separate solvers | **Dissolved TCE is not DNAPL** |
+
+### 12.3 Governing equations and mass bookkeeping
+
+For a simple homogeneous saturated domain with linear equilibrium sorption, a teaching form of the advection–dispersion–reaction equation is:
+
+`R_f ∂C/∂t = ∇·(D ∇C) − v·∇C − λ R_f C + S_C`
+
+Here `C` is dissolved concentration, `D` the hydrodynamic dispersion tensor, `v` pore-water velocity, and `S_C` a consistently normalised source term. The shown decay term assumes first-order loss of the combined equilibrium sorbed/dissolved inventory; other reaction assumptions require different terms. This simplified equation assumes suitable constant properties and divergence-free steady flow.
+
+**Implementation should instead use a conservative finite-volume mass balance**, with cell inventories and face fluxes:
+
+- `V_water = n_e * V_saturated_cell` [m³].
+- `M_aqueous = C * V_water` [kg].
+- `F_adv_face = Q_face * C_upwind` [kg/s].
+- `F_disp_face = -n_e * A_face * D_normal * (C_j - C_i) / distance` [kg/s], with appropriate face averaging and sign convention.
+- `D_L = alpha_L * |v| + D_m_effective`; `D_T = alpha_T * |v| + D_m_effective`. Use a tensor and face-normal projection for general flow directions.
+- For equilibrium sorption, either represent total equilibrium inventory with retardation **or** explicitly track dissolved/sorbed pools; do not apply both independently.
+- Track `M_initial + M_sources = M_aqueous + M_sorbed + M_NAPL + M_extracted + M_exported + M_transformed + residual`, with constituent/species accounting defined consistently.
+- Keep concentration nonnegative, use stability-limited numerical substeps, and report mass-balance error.
+- **Do not use an arbitrary contaminant “speed boost”** as a real physics mechanic. Players can control scenario-authorised source timing or environmental interventions; contaminant intrinsic properties remain fixed.
+
+### 12.4 Numerical verification before expanding features
+
+Build automated, deterministic tests for:
+
+1. **No-flow/no-gradient:** no advective transport; diffusion only if concentration gradients exist.
+2. **Uniform flow:** correct advective direction, velocity and travel time.
+3. **Conservation:** internal transfers cancel exactly; external sinks/sources reconcile with inventory.
+4. **Nonnegative mass:** no negative concentrations after substeps.
+5. **Pure diffusion:** plume spreads at zero groundwater velocity.
+6. **Longitudinal vs transverse dispersion:** elongation follows flow direction and broadening follows transverse dispersivity.
+7. **Retardation:** breakthrough delayed by expected factor for an equilibrium linear sorption benchmark.
+8. **Decay and daughter products:** known first-order analytical behavior; constituent mass tracked through transformation.
+9. **Well capture:** pumping changes flow field and removes dissolved mass by extracted-water concentration.
+10. **Heterogeneous K:** solved head field obeys water balance; preferential paths emerge without arbitrary rules.
+
+Compare simple one-dimensional advection–dispersion breakthrough curves with analytical solutions; later compare suitable benchmark cases with established groundwater-flow/transport software. Record assumptions, units, time step, grid resolution and tolerance in `docs/SIMULATION_ASSUMPTIONS.md`.
+
+### 12.5 Educational user interface
+
+Make **cause and effect inspectable**:
+
+- Toggle geology/K, hydraulic head/equipotentials, water-flux arrows, dissolved concentration, sorbed inventory, reactions and remediation.
+- Inspect each cell's geology, K, porosity, head, fluxes, concentration and mass.
+- Display **source → pathways → receptor**, travel time and breakthrough curves.
+- Offer prediction-before-simulation prompts, then explain observed migration.
+- Display simulation time separately from game turns, and show a mass-balance panel.
+- Label simplified mechanics explicitly; avoid presenting approximate results as field predictions.
+
+### 12.6 Revised milestone gates
+
+- **Gate A — verified flow:** uniform-K benchmark plus conservative heterogeneous-K head solver.
+- **Gate B — verified transport:** conservative tracer advection with stable time stepping and mass accounting.
+- **Gate C — physical plume:** effective molecular diffusion and anisotropic longitudinal/transverse dispersion.
+- **Gate D — reactive transport:** sorption/retardation, degradation, species transformations and reaction accounting.
+- **Gate E — coupled scenarios:** recharge, pumping, river boundaries, monitoring and physically credible remediation.
+- **Gate F — vertical/advanced:** 3–5 layers, cross-sections, matrix diffusion and optional multiphase physics.
+
+**Claude Code working rule:** Implement one gate at a time. For each physics feature, provide governing equations, dimensional checks, numerical method, assumptions, automated tests and a visible diagnostic before calling it complete.
 
 ## 11. Confidence and caveats
 
 - **Concept and engine fit:** 0.95 — 2D hex-grid strategy is a strong match for Godot.
 - **Prototype feasibility:** 0.85 — achievable if flow/transport scope is strictly limited.
 - **Scientific fidelity:** 0.80 for a validated single-layer conservative model; lower for multiphase NAPL, complex geochemistry and unsaturated-zone flow without dedicated solvers.
-- **Schedule:** 0.5 (revised down from 0.65) — the visual/audio quality bar in §6 is now explicit first-class scope, not a Phase 3/4 afterthought, and is realistically comparable in effort to the simulation engine (§7). Estimates still depend heavily on Godot familiarity, art/audio skill or budget, and available development hours.
-- **Visual pillar feasibility:** 0.7 — the tools (§7) are all proven and widely used by solo devs, but marrying legible scientific overlays with genuinely charming pixel art (§6) is a real, untested design problem for this specific project, not just an execution risk. Phase 0 exists to de-risk it early rather than discover it late.
+- **Schedule:** 0.65 — estimates depend heavily on Godot familiarity and available development hours.
 
 This is a design brief, not a verified groundwater model or a claim that all mechanics are scientifically validated.
-
-## 12. Revision notes
-
-**2026-10-13 — Player flipped from plume to engineer.** Originally the player embodied the contaminant, with an AI opponent playing the engineer. Changed so the player is the engineer/investigator protecting a receptor (flagship: a farm's drinking-water well) from a plume that's governed by physics and scenario events, not played by anyone. Reasons, in order of weight:
-
-1. **Removes the hardest unsolved problem in the original design.** A competent adversarial "AI engineer" is a much harder build than the groundwater physics itself. An engineer-as-player / plume-as-physics design needs zero game-AI to be a worthy opponent — the opponent is just unforgiving transport equations, which this brief already specifies in detail.
-2. **Better win-state tone.** "Win by poisoning a farm's well" is an uncomfortable payoff to design toward, even as a puzzle abstraction. "Protect the farm" carries the same stakes without that discomfort.
-3. **Stronger pedagogical core.** "Characterize an unknown site under budget, then design a remedy that holds up against real capture-zone and reaction-kinetics physics" models the actual job of an environmental engineer/hydrogeologist, rather than teaching hydrogeology from the contamination side.
-4. Added two concrete mechanics to keep cleanup-mode from collapsing into "click tool, win" (and to replace the tension the adversarial AI would have provided): **fog-of-war site characterization** (§3, §4, guardrail 9) and an explicit **remediation-can-fail** guardrail (guardrail 8).
-
-**Not discarded:** the original "embody the plume" premise is a genuinely distinctive hook, so it's kept as a later asymmetric-multiplayer/hard mode (§5) built on the same simulation core — nothing about the shared architecture (§7) needed to change to support this later.
-
-**2026-10-13 — Visual/audio quality elevated to a first-class pillar; added a Phase 0 spike.** Added design pillar 2 (§1), rewrote §6 around the risk of pretty art vs. legible data overlays fighting each other, added an art/animation/audio tooling list (§7), and added a time-boxed "look-and-feel spike" ahead of Phase 1 systems work (§8) to answer that risk — plus three other concrete unknowns (interaction feel, tile budget, style source) — before committing to a full tileset. Reasoning: the stated goal (a landscape the player feels protective of, smooth polished interactions, sound) is a real, distinct pillar from the simulation fidelity work, with its own failure modes (most educational games fail specifically here) — it needed its own section and its own early validation step rather than living implicitly inside "Phase 3 presentation." Schedule confidence (§11) revised down accordingly, and a new "visual pillar feasibility" caveat added rather than folding the risk silently into the existing schedule number.
