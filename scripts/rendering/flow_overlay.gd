@@ -26,14 +26,39 @@ const GridModel = preload("res://scripts/simulation/grid_model.gd")
 @export_range(1.0e5, 1.0e8, 1.0e5) var arrow_scale: float = 4.0e6
 @export_range(4.0, 80.0) var arrow_max_length: float = 40.0
 
+## Animated shaft (brief SS6: "animated flow arrows"): dashes scroll from
+## the cell center toward the arrowhead -- i.e. toward where the water is
+## actually going, not just a generic sparkle -- at a rate scaled by the
+## arrow's own (already-clamped) length, so a fast well-capture cell's
+## dashes visibly race while a clay-constrained cell's dashes barely creep.
+## That ties the animation's speed to real relative flow magnitude instead
+## of decorating every cell identically, in the same "make the reason
+## visible" spirit as the arrow's length already being physically meaningful
+## (design guardrail 6). Inspector-tunable per the usual practice
+## (memory/feedback_expose_visual_tuning.md).
+@export_range(2.0, 20.0) var dash_length_px: float = 6.0
+@export_range(1.0, 20.0) var dash_gap_px: float = 5.0
+@export_range(0.0, 5.0) var dash_speed_factor: float = 1.5
+
 var _ground: TileMapLayer
 var _model: GridModel
 var _cells: Array[Vector2i] = []
+var _time: float = 0.0
 
 func configure(ground: TileMapLayer, model: GridModel, cells: Array[Vector2i]) -> void:
 	_ground = ground
 	_model = model
 	_cells = cells
+	queue_redraw()
+
+## Only animates while actually shown -- this node's own `visible` flag
+## (toggled by World.set_xray_mode indirectly and the F key below) is enough
+## to gate it; no point re-issuing hundreds of draw calls a frame for an
+## overlay nobody can see.
+func _process(delta: float) -> void:
+	if not visible or _model == null:
+		return
+	_time += delta
 	queue_redraw()
 
 ## Runtime toggle, independent of World.show_flow_overlay's Inspector
@@ -73,10 +98,47 @@ func _draw() -> void:
 
 func _draw_arrow(center: Vector2, vec: Vector2) -> void:
 	var tip := center + vec
-	draw_line(center, tip, arrow_color, arrow_width)
+	var shaft_len: float = vec.length()
+	_draw_dashed_line(center, tip, dash_length_px, dash_gap_px, _time * shaft_len * dash_speed_factor)
 	var angle := vec.angle()
-	var head_len: float = minf(vec.length() * 0.35, 8.0)
+	var head_len: float = minf(shaft_len * 0.35, 8.0)
 	var left := tip + Vector2.from_angle(angle + PI - 0.4) * head_len
 	var right := tip + Vector2.from_angle(angle + PI + 0.4) * head_len
 	draw_line(tip, left, arrow_color, arrow_width)
 	draw_line(tip, right, arrow_color, arrow_width)
+
+## Pure segment math, deliberately split from the actual draw_line calls
+## (same "separate the math from the drawing" discipline flow_solver.gd
+## follows for the numerics) so the dash pattern itself is testable without
+## a live Viewport/draw context. Returns [start, end] pairs along the
+## from->to axis (each already clipped to [0, total_len]) for a dash pattern
+## that scrolls toward `total_len` (i.e. toward `to`, the arrowhead) as
+## `phase` increases -- phase is normally _time * shaft_len * dash_speed_factor,
+## so this is also where "faster flow -> faster-scrolling dashes" actually
+## happens, not just a cosmetic wobble.
+static func _dash_segments(total_len: float, dash_len: float, gap_len: float, phase: float) -> Array[Vector2]:
+	var segments: Array[Vector2] = []
+	if total_len <= 0.0 or dash_len <= 0.0:
+		return segments
+	var period: float = dash_len + gap_len
+	if period <= 0.0:
+		segments.append(Vector2(0.0, total_len))
+		return segments
+	var start: float = fposmod(phase, period) - period # in [-period, 0) -- increasing phase shifts every dash toward larger t, i.e. toward `to`
+	var t := start
+	while t < total_len:
+		var seg_a: float = maxf(t, 0.0)
+		var seg_b: float = minf(t + dash_len, total_len)
+		if seg_b > seg_a:
+			segments.append(Vector2(seg_a, seg_b))
+		t += period
+	return segments
+
+func _draw_dashed_line(from: Vector2, to: Vector2, dash_len: float, gap_len: float, phase: float) -> void:
+	var diff := to - from
+	var total_len: float = diff.length()
+	if total_len <= 0.0:
+		return
+	var dir := diff / total_len
+	for seg in _dash_segments(total_len, dash_len, gap_len, phase):
+		draw_line(from + dir * seg.x, from + dir * seg.y, arrow_color, arrow_width)

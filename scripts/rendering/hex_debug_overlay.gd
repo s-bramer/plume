@@ -1,3 +1,4 @@
+@tool
 extends Node2D
 
 ## Diagnostic overlay per godot_hex_map_spec.md: draws each cell's logical
@@ -6,6 +7,14 @@ extends Node2D
 ## (World.show_debug_overlay) -- diagnostic only, not a design element.
 ## The permanent hex grid line is a separate node (grid_outline.gd), since
 ## that's a real part of the look, not something to debug with.
+##
+## @tool (2026-10-29, sandbox follow-up): World.gd calls configure() on this
+## from its own editor-hint branch too now, so these axial labels are
+## visible WHILE EDITING, not just at runtime -- that's what lets you read
+## off which (q, r) to type into a sandbox_features entry's `axial` field,
+## since there's no other way to discover that coordinate without it (unlike
+## Ground, which you paint by clicking directly, no coordinate needed).
+## _draw() is the only virtual this script overrides, so @tool is harmless.
 
 const GodotHexOffset = preload("res://scripts/rendering/godot_hex_offset.gd")
 

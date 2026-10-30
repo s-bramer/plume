@@ -2,16 +2,16 @@
 
 importer="texture"
 type="CompressedTexture2D"
-uid="uid://b40beprkuvttn"
-path="res://.godot/imported/Groundwater Simulation Asset Sheet.png-6a5200af44abb9cbbe74f7088f44cf41.ctex"
+uid="uid://c4s4ofmmtmt28"
+path="res://.godot/imported/rocky_04.png-0de4b4a69a519a3fef2bd7f9ed3f0ebd.ctex"
 metadata={
 "vram_texture": false
 }
 
 [deps]
 
-source_file="res://art/pretty_tiles/Groundwater Simulation Asset Sheet.png"
-dest_files=["res://.godot/imported/Groundwater Simulation Asset Sheet.png-6a5200af44abb9cbbe74f7088f44cf41.ctex"]
+source_file="res://art/pretty_tiles/tiles/rocky_04.png"
+dest_files=["res://.godot/imported/rocky_04.png-0de4b4a69a519a3fef2bd7f9ed3f0ebd.ctex"]
 
 [params]
 

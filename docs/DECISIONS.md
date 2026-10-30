@@ -2026,3 +2026,684 @@ stress scenario (331 cells, all 6 bands at their largest, `--rendering-driver op
 `RenderingServer.frame_post_draw` end-to-end path actually runs) -- completed cleanly with no triangulation
 error, band_loops ~162ms, full real redraw+frame ~239ms, both in line with (in fact slightly faster than) the
 previous fix's measured numbers.
+
+## 2026-10-27 — Tree wind sway + a synced contact shadow
+
+User ask, as a "look and feel" detour before returning to transport work: "add a light back and forth to the
+trees as they shake in the wind and a shadow underneath that interacts with the movement." Scoped to trees only
+(not rocks/decals/mountains, per the ask) -- see brief §6 ("Visual direction and UX") for where this kind of
+polish sits in the project's stated priorities.
+
+**Implementation** (`scripts/rendering/world.gd`, `scripts/rendering/shaders/tree_sway.gdshader`,
+`scripts/rendering/shaders/tree_shadow_sway.gdshader`, `scripts/rendering/tree_shadow_texture.gd`): a new
+`_add_tree_feature()` wraps the existing `_add_feature()` (left untouched, so every test that assumes a plain
+feature's sprite is `root.get_child(0)` still holds) and adds two things, both GPU-side (a canvas_item vertex
+shader), not per-frame GDScript -- zero added script cost no matter how many trees are on screen:
+
+- **Canopy sway**: `tree_sway.gdshader` bends the sprite from a fixed pivot at the trunk base
+  (`VERTEX.x += sin(TIME * sway_speed + phase) * sway_amount_px * (1.0 - UV.y)`) -- UV.y=1 at the texture's
+  bottom (the trunk, which `_add_feature`'s `ground_anchor` already places at this node's local origin) stays
+  planted; UV.y=0 at the top (the canopy) gets the full lean. A real bend, not a whole-sprite rotation/translation.
+- **Contact shadow**: a procedurally generated soft radial-falloff blob (`tree_shadow_texture.gd`, same
+  "compute it, don't import an asset" approach as `hex_tile_texture.gd`), squashed into an oval
+  (`tree_shadow_squash`) and given its own simpler shader (`tree_shadow_sway.gdshader`, a uniform sideways shift,
+  no bend) with the SAME per-tree `phase`/`sway_speed` as the canopy (smaller `sway_amount_px`) so it visibly
+  tracks its own tree, not some other one.
+
+Every tunable (`tree_sway_amount_px`, `tree_sway_speed`, `tree_shadow_sway_fraction`, `tree_shadow_opacity`,
+`tree_shadow_squash`, `tree_shadow_diameter_fraction`, `tree_shadow_offset`) is an `@export`/`@export_range` on
+World, per `memory/feedback_expose_visual_tuning.md` -- fine visual tuning belongs in the Inspector, not another
+round of code-and-reverify.
+
+**Two real bugs found and fixed during verification, both worth recording**:
+
+1. **The shadow sorted in front of its own tree instead of behind it.** The first version nudged the shadow
+   "down and forward" by setting `shadow.position` directly. Y-sort (`features.y_sort_enabled`) reads a
+   CanvasItem's own `position` to decide draw order, and that nudge made the shadow's global Y strictly greater
+   than its own tree sprite's -- so Y-sort (correctly, by its own rule: greater Y draws later/"in front") painted
+   the shadow ON TOP of the tree's lower trunk instead of underneath it. Fix: the shadow's node `position` stays
+   at the root's exact origin (tied with the sprite, so sibling order -- shadow added as child 0 -- decides it,
+   same trick `_test_feature_overlap_depth_rule` already relies on for ordinary features); the visual "nudge
+   down" moved into the shader instead (`tree_shadow_sway.gdshader`'s `offset_px` uniform, applied to `VERTEX`),
+   which happens entirely GPU-side after Y-sort has already run and so can never perturb it.
+2. **The shadow was invisible even once correctly behind the tree.** This art's canopy hangs low, close to the
+   ground-contact point, so a shadow sized/centered tightly under the trunk (the first attempt: diameter = 55%
+   of tree width) was entirely hidden behind the foliage's own silhouette. Fixed by widening it
+   (`tree_shadow_diameter_fraction` default raised to 0.9 of tree width) and increasing the downward shader
+   offset (6px -> 14px) so its edges clear the canopy and it actually reads as a shadow on the grass. Confirmed
+   via a real rendered screenshot, cropped and upscaled around a tree's trunk base.
+
+**New tests** (`tests/run_tests.gd`, `_test_tree_sway_and_shadow`): the shadow is child 0 / sprite is child 1 (so
+the shadow draws first/underneath); neither gets its own `z_index`; the shadow's node `position` is exactly
+`Vector2.ZERO` (the regression guard for bug 1 above); both use the correct, distinct shaders; a tree's shadow
+shares its canopy's exact `phase` (sync) while two different trees get different phases (desync, so a forest
+doesn't sway in lockstep); the shadow's `sway_amount_px` is smaller than the canopy's but nonzero; and at least
+one naturally-generated tree from the real `_build_features()` pass (not just a direct test call) has the
+shadow too. Suite: 277/277, clean headless load.
+
+Re-verified visually: a real rendered screenshot (`--rendering-driver opengl3`) of an actual forest cell, cropped
+and upscaled, shows a clear soft oval shadow under the trunk; a second screenshot taken ~4.2 real seconds later
+(timed via `Time.get_ticks_msec()`, not a frame count -- this environment runs an uncapped script-driven
+`SceneTree` far faster than real-time, so a fixed frame count is not a reliable proxy for elapsed wall time) shows
+the canopy visibly leaned over and the shadow shifted with it.
+
+Also confirmed (re-derived from last session's lesson, extended): instantiating a full live scene
+(`get_root().add_child(main)`, triggering real `_ready()`) hangs indefinitely under `--headless` even with no
+`await RenderingServer.frame_post_draw` anywhere in the probe -- apparently any live scene instantiation needs
+`--rendering-driver opengl3`, not just screenshot-taking probes specifically. `@onready` vars (e.g. `features`)
+also aren't populated the instant `add_child()` returns inside a custom `SceneTree._init()`; a probe needs at
+least a couple of `await process_frame` cycles first, same as the existing screenshot probes already did.
+
+## 2026-10-27 — Animated flow arrows
+
+User ask, continuing the look-and-feel detour: "please animated flow arrows next" (brief §6: "animated flow
+arrows and well influence" is one of the few concrete asks in the visual-direction section).
+
+**Implementation** (`scripts/rendering/flow_overlay.gd`): the shaft of each arrow is now a scrolling dash
+pattern instead of one solid line, with the dashes moving from the cell center toward the arrowhead -- i.e.
+visually "toward where the water is going," not just a generic sparkle. The scroll SPEED is scaled by the
+arrow's own (already-clamped) pixel length (`dash_speed_factor`), so a fast well-capture cell's dashes visibly
+race while a clay-constrained cell's barely creep -- the animation itself carries information (relative flow
+magnitude) rather than just decorating every cell identically, the same "make the reason visible" spirit as the
+arrow's length already being physically meaningful (design guardrail 6). The arrowhead stays a solid static
+mark; only the shaft dashes, so the overlay still reads clearly as "arrow," not noise.
+
+Unlike the tree sway (a GPU vertex shader, since Sprite2D textures have UVs to bend along), this overlay only
+ever issues raw `draw_line()` calls in `_draw()` -- no texture, so no UV to drive a fragment shader with. Animated
+it the direct way instead: a new `_process(delta)` accumulates `_time` and calls `queue_redraw()` every frame
+(guarded by `if not visible: return`, since this overlay defaults OFF in `scenes/main.tscn` and is toggled by the
+F key -- no point re-issuing hundreds of draw calls a frame for an overlay nobody can see), and `_draw_arrow`
+picks the dash pattern's phase from `_time * shaft_len * dash_speed_factor`.
+
+The dash-segment math is split into a pure static `_dash_segments(total_len, dash_len, gap_len, phase) ->
+Array[Vector2]` -- same "separate the math from the drawing" discipline `flow_solver.gd` already follows for the
+numerics, and the same reason `_flow_vector` was already split out this way -- so the scrolling logic is
+testable without a live draw context. New tunables (`dash_length_px`, `dash_gap_px`, `dash_speed_factor`) are
+`@export_range` on FlowOverlay, per the usual practice (`memory/feedback_expose_visual_tuning.md`).
+
+**New tests** (`tests/run_tests.gd`, `_test_flow_overlay_dash_segments`): a zero-length shaft produces no
+segments; a known phase=0 case matches hand-computed segment positions exactly; every segment stays clipped
+inside `[0, total_len]` regardless of how large phase gets; increasing phase shifts a dash toward larger t (i.e.
+toward the arrowhead, not backward -- the exact kind of sign-flip bug `_flow_vector`'s own test guards against
+for the vector itself); the pattern exactly repeats every `dash_length + gap_length` of phase. Suite: 284/284,
+clean headless load.
+
+Re-verified visually (`--rendering-driver opengl3`): a real screenshot of the strongest-flow cell on the map
+(found by scanning `_flow_vector` magnitude across every cell, not guessed), cropped and upscaled, shows the
+expected dashed shaft + solid arrowhead. A second screenshot ~1 real second later (`Time.get_ticks_msec()`-gated,
+not a frame count -- same lesson as the tree-sway verification) shows the dashes visibly shifted along the
+shaft. One false alarm during this check, worth recording: an earlier attempt at ~1.7s elapsed showed two
+seemingly-identical screenshots -- not a bug, but `dash_speed_factor * shaft_len` and the ~1.7s gap happened to
+land within half a pixel of a whole number of dash periods (confirmed by reading `flow_overlay._time` directly
+before each screenshot: it HAD advanced correctly, 0.08s -> 1.72s, matching real elapsed time). Any periodic
+animation check needs a wait duration that isn't a near-multiple of the period, or the comparison is meaningless
+by coincidence, not because nothing moved.
+
+## 2026-10-27 — Animated water shimmer
+
+User ask, continuing the look-and-feel detour: "water shimmer next please. Please provide slider to adjust it."
+(brief §6 names "pixel-art terrain" and mood lighting; this is the water-surface half of that, after trees and
+flow arrows.)
+
+**Implementation** (`scripts/rendering/water_shimmer_overlay.gd`, `scripts/rendering/shaders/water_shimmer.gdshader`):
+a new always-on overlay (NOT x-ray-gated -- ambient mood only, never obscures simulation data, per brief §6's own
+"never obscure critical simulation information"), inserted in `scenes/main.tscn` right after `Ground` and before
+`GridOutline` so the grid/shore lines still draw crisply on top of it. For every water cell (`World._river_cells`
+-- confirmed the ONLY source of `TERRAIN_WATER`, see `_terrain_for`), it draws one translucent hex polygon
+using the exact same `HexMath.hex_points()` + `World.TILE_SIZE` scaling `grid_outline.gd` already uses (tested
+directly against `GridOutline._outline_points()` so the two can never silently drift apart). A single
+canvas_item fragment shader on the whole overlay node paints one shared moving diagonal glint band in WORLD
+space across every water polygon at once -- deliberately one continuous phase, not a per-cell random one (unlike
+the trees' deliberately-desynced phase): light glinting off a lake should read as one surface, not independently
+sparkling tiles. Same "GPU animates, GDScript just redraws flat shapes every frame" split as `tree_sway.gdshader`,
+so the cost stays flat regardless of water cell count.
+
+**New sliders** (WaterShimmerOverlay, Inspector, per `memory/feedback_expose_visual_tuning.md`): `shimmer_color`
+(base translucent wash), `shimmer_speed`, `shimmer_scale` (glint band spacing), `shimmer_strength` (how much
+extra opacity the band adds at its peak), `shimmer_band_sharpness` (narrow crisp glints vs. broad soft waves).
+
+**One real bug found and fixed during verification**: the shader's first version brightened the glint by adding
+to `COLOR.rgb`, and `shimmer_color`'s default is near-white -- additively brightening an already-near-white base
+clamps invisibly (white plus anything is still white), so the very first screenshot showed no visible shimmer at
+all despite the shader compiling and running correctly. Fixed by modulating `COLOR.a` instead: the glint band
+now boosts the translucent wash's OPACITY rather than its color, which both fixes the visibility bug and reads
+more like real water (a brighter, more-opaque glint flaring in and fading out) than a flat color shift would
+have. Caught by a real rendered screenshot, not by code review -- this specific failure mode (additive
+brightening clamping invisibly against a white base) has no headless-testable signature; only actually rendering
+it shows it.
+
+**New tests** (`tests/run_tests.gd`, `_test_water_shimmer_overlay`): `configure()` is given exactly the water
+cells and nothing else (checked against `World._terrain_for` as ground truth, not just a count); the shimmer
+polygon's geometry exactly matches `GridOutline`'s independently-derived hex outline, corner for corner. Same
+"drawn, not tested headlessly" scope as every other `_draw()`-based overlay in this project (`GridOutline`'s
+shore edges, `FlowOverlay`'s arrow geometry) -- the moving glint itself lives entirely in the GPU shader, nothing
+pure-math to unit-test there. Suite: 314/314, clean headless load.
+
+Re-verified visually (`--rendering-driver opengl3`): a real screenshot centered on a cluster of water cells
+(picked from the actual generated river, not guessed) shows a clear diagonal bright band across the water. A
+second screenshot ~2.3 real seconds later (`Time.get_ticks_msec()`-gated, chosen deliberately not to be a
+near-multiple of the shimmer's own period, per the flow-arrows entry's lesson) shows the band visibly shifted
+along the diagonal.
+
+## 2026-10-27 — Ambient day/night mood lighting (CanvasModulate)
+
+Last item from the trees/water/flow "alive, beautiful, precious" look-and-feel pass. Added
+`scripts/rendering/mood_lighting.gd` on a new `MoodLighting` node (a `CanvasModulate`, between
+`WaterShimmerOverlay` and `GridOutline` in `scenes/main.tscn`). `CanvasModulate` tints every `CanvasItem` in the
+main viewport at once -- the same "the engine does the per-pixel work, GDScript just updates one value every
+frame" cost profile as the other mood passes, except here there's nothing to draw at all, just one `Color`
+property to set.
+
+Cycles `day -> dusk -> night -> dusk -> day` on a continuous loop: a pure `_phase_color(phase, day, dusk, night)`
+function (phase wraps every 1.0, four evenly-spaced stops, straight `Color.lerp` between neighbors) wrapped by
+`_cycle_color(time, duration, ..., strength)`, which maps elapsed time to phase via `cycle_duration_sec` and
+blends the result toward `Color.WHITE` by `strength` -- same "separate the math from the drawing" split as
+`FlowOverlay._dash_segments` and `WaterShimmerOverlay`'s outline math, and fully testable headlessly since the
+whole effect is one deterministic color computation with no shader/GPU step involved.
+
+**Design choice: deliberately gentle, not a real night.** `night_color` is a dim, cool blue-grey
+(`Color(0.4, 0.45, 0.65)`), never black, and `strength` defaults to `0.5` (halfway toward `Color.WHITE`) rather
+than `1.0`. This directly follows the brief's §6 guardrail that ambient/mood effects must never obscure critical
+simulation information -- `CanvasModulate` tints *everything* in the canvas, including the x-ray overlays, the
+plume fill, and flow arrows, since they're ordinary `CanvasItem`s in the same viewport with no special exemption.
+A full-strength, near-black night would risk making those unreadable at the cycle's dark end; confirmed in the
+verification screenshots below that UI/label text stays legible even at a strong tint.
+
+**Sliders**, all on the `MoodLighting` node (per `memory/feedback_expose_visual_tuning.md`): `day_color`,
+`dusk_color`, `night_color` (the three-stop palette), `cycle_duration_sec` (how long one full day/night loop
+takes), `strength` (0 = no tint at all, 1 = the full undiluted palette).
+
+**New tests** (`tests/run_tests.gd`, `_test_mood_lighting`): each of the four phase stops (0.00/0.25/0.50/0.75)
+returns its exact palette color; phase 1.0 matches phase 0.0 (the loop has no seam); a between-stops phase is a
+straight lerp; `strength=0.0` always returns `Color.WHITE` regardless of time/duration; `strength=1.0` at the
+half-duration mark returns the exact, undiluted night color; `strength=0.5` returns the color halfway to white;
+scaling `cycle_duration_sec` scales the period rather than shifting it (the same *fraction* of two different
+durations lands on the same color). All pure math, no node/Viewport needed. Suite: 324/324, clean headless load.
+
+Re-verified visually (`--rendering-driver opengl3`, `cycle_duration_sec` and `strength` overridden in the probe
+only, to 4.0s/1.0 respectively, so a real shift is visible within a short wait -- the scene's own slower/subtler
+defaults would be too gradual to tell apart from noise in a quick screenshot diff): a screenshot at `_time=0.16s`
+(`color` near-white, `(1.0, 0.95, 0.92)`) versus one ~2.16s later at `_time=2.32s` (`color` dimmed and cooled to
+`(0.59, 0.52, 0.60)`, past the dusk stop and heading into night) shows the whole scene visibly darker and
+cooler-toned in the second frame, with the status-panel text still fully readable in both.
+
+## 2026-10-29 — Water effects: shoreline ripples; seamless connected water; glints replace the scrolling band
+
+The user reported the water shimmer from 2026-10-27 "looks too static" and asked for three specific things:
+shoreline ripples on edges that border land; a seamless water surface where individual hex boundaries aren't
+visible; and occasional world-space glints instead of one continuously scrolling band.
+
+**Shoreline ripples (new file, `scripts/rendering/shoreline_ripple_overlay.gd` + new `ShorelineRippleOverlay`
+node in `scenes/main.tscn`, between `GridOutline` and `Features`).** For every water cell, checks all 6
+neighbors (not just 3) and draws a small, pale, dashed line just inside the water, inset toward the hex centre by
+`ripple_inset_fraction`, on any edge whose neighbor is real, placed, non-water. Deliberately NOT built on
+`GridOutline`'s existing `_is_shore_edge` -- that one is intentionally restricted to the 3 camera-facing north
+edges (a one-direction "cliff face" illusion, see its header comment), which is the wrong rule for a ripple: real
+water laps at land on every side it touches, regardless of which way the camera happens to be facing. Dash
+geometry reuses `FlowOverlay._dash_segments` (literally the same function, duplicated rather than imported so
+the overlay stays self-contained) to scroll broken dashes along each shore edge; opacity additionally pulses per
+edge via a new `_pulse()` function, phase-offset per edge by `World._pseudo_random01(axial, edge_index + 101.0)`
+so the whole shoreline doesn't flash in lockstep -- each edge reads as its own small wave lapping in and
+receding on its own timing, not a synchronized strobe.
+
+**Seamless connected water (`grid_outline.gd`, not a new file).** Investigated why water read as a lattice of
+individual hexes despite the shimmer shader already being world-space-continuous: `GridOutline` draws its
+permanent grey grid line on *every* edge of *every* cell, water included, except where `_is_shore_edge` swaps in
+the darker cliff-cue line -- so two adjacent water cells still got an ordinary grey line drawn straight across
+their shared, fully-open interior edge. That line, not the shimmer shader, was the actual "individual tile
+boundaries visible" culprit. Added `_is_water_interior_edge(axial, offset, edge_index)` (true iff both the cell
+and its neighbor across that edge are real, placed water) and a new `_ALL_EDGE_NEIGHBOR_OFFSETS` table (all 6
+edges, extending the existing 3-edge `_SHORE_EDGE_NEIGHBOR_OFFSETS` derivation) -- `_draw()` now skips the edge
+entirely (no line, either color) whenever this is true. Land-land edges and shore (water-land) edges are
+unaffected. This is a one-line geometry fix, not a shader or mesh change -- no need to union hex polygons into a
+single mesh (the shader was already seamless; only the separately-drawn grid lines on top of it weren't).
+
+**Occasional glints replace the scrolling band (`scripts/rendering/shaders/water_shimmer.gdshader`,
+`water_shimmer_overlay.gd`).** The single continuously-scrolling diagonal band (2026-10-27's version) is the
+same motion forever once you watch it for more than a few seconds -- correctly read as "static" even though it
+was technically moving. Replaced with a jittered-grid point-glint scatter: world space is divided into
+`glint_cell_size`-px lattice cells, each cell gets one pseudo-randomly jittered point (`hash22`), and each point
+flashes briefly on its own randomized cycle (`hash11`-derived phase, `glint_frequency` flashes/sec,
+`glint_duration` fraction of each cycle visible, a `sin(t*PI)` rise-then-fall for a smooth pulse rather than a
+hard on/off). A pixel's own `world_pos` (unchanged from the prior version's vertex-shader varying) is still what
+makes this continuous across hex polygon boundaries -- which lattice cell a glint belongs to, and when it
+flashes, depends only on world position and `TIME`, never on which polygon is currently being rasterized under
+it, so a glint never "restarts" at a hex edge. New export `glint_tint`/`glint_tint_strength` lets a glint also
+shift colour (via `mix`, not addition -- stays visible against a near-white base, unlike the additive-RGB bug
+from 2026-10-27's entry) on top of the existing alpha-boost mechanism. All five old band exports
+(`shimmer_speed`/`shimmer_scale`/`shimmer_strength`/`shimmer_band_sharpness`) are gone, replaced by
+`glint_cell_size`, `glint_radius_px`, `glint_frequency`, `glint_duration`, `glint_strength`, `glint_tint`,
+`glint_tint_strength` -- the user's prior Inspector tuning on the old names no longer applies; removed the stale
+overrides from `scenes/main.tscn` rather than leave them silently ignored.
+
+**New tests** (`tests/run_tests.gd`): `_test_grid_outline_water_interior_edges` -- the new `_ALL_EDGE_NEIGHBOR_
+OFFSETS` table is geometrically verified (each entry actually points toward its matching edge, same check as the
+existing shore-edge test) rather than just asserted, then a 3-cell connected lake confirms both directions of a
+water-water edge are interior (symmetric) while the lake's actual land-facing ends are not.
+`_test_shoreline_ripple_overlay` -- same geometric verification for `_EDGE_NEIGHBOR_OFFSETS`, confirms a water
+cell's south edge (not just north) counts as a ripple shore edge when it borders land (the deliberate difference
+from `GridOutline`'s camera-restricted rule), confirms open water-to-water isn't a ripple edge, re-checks the
+reused dash-segment math against the known case from `_test_flow_overlay_dash_segments`, and checks `_pulse` stays
+within `[ripple_pulse_min, 1.0]`, is periodic, and that two different phase offsets actually produce different
+values at the same instant (one iteration needed: the first version compared `phase01=0.0` against `phase01=0.5`,
+which coincidentally land on the same `sin` value one full half-cycle apart -- fixed by using `phase01=0.25`
+instead). The glint shader itself has no headless-testable signature, same "drawn, not tested headlessly" scope
+as every other GPU-side effect in this project. Suite: 337/337, clean headless load.
+
+Re-verified visually (`--rendering-driver opengl3`, zoomed into a river stretch, glint density/strength bumped
+in the probe only for a clearer screenshot at this zoom): the screenshot shows the river reading as one
+continuous water surface with no grid line down its center, pale dashed ripples along every edge bordering grass
+on both banks (not just the north-facing ones), and several small glint points scattered across the water. A
+second screenshot 1.4 real seconds later shows some glints faded out, new ones appeared at different positions,
+and the ripple dashes have visibly scrolled -- confirming occasional, independently-timed sparkles rather than
+one coherent shape in constant motion.
+
+## 2026-10-29 — Amended shoreline ripples: wash inward, don't scroll along the shore
+
+The ripple motion in the entry above was wrong on reflection -- the user clarified it should NOT move parallel
+along the shoreline (a tangential scroll) at all: a real shoreline ripple appears right at the water's edge,
+washes a couple pixels inward toward shore, then fades -- a perpendicular in-and-out motion, not a sideways
+drift. Also sharpened "different shoreline segments animate at different times" to mean each individual broken
+dash, not just each hex edge.
+
+Reworked `shoreline_ripple_overlay.gd`: `_dash_segments` is now called once with a fixed `phase=0.0` (the broken
+dashes along an edge are a static layout, never scrolling tangentially) instead of a time-driven scroll phase.
+Replaced `_pulse()` (opacity-only, floored so it never fully vanished) with `_ripple_state(time, speed, phase01,
+active_fraction, max_expand_px)`, which returns both an alpha multiplier AND an inward-drift distance together:
+at the start of a ripple's own active window it sits exactly at the true edge (drift=0), by the window's end it
+has washed to `max_expand_px` (drift scales linearly with the same progress `t` that drives alpha), and alpha
+itself rises then falls via `sin(t * PI)` so it's a smooth appear-expand-fade rather than a hard cut -- and
+outside its active window it's fully invisible (not dimmed to a floor the way the old `_pulse` was), a real gap
+before that same dash ripples again. The inward direction is computed per edge from the two hex corners it
+connects (`-(corner_a + corner_b).normalized()`, pointing from the edge toward the hex's own centre) and applied
+as a uniform translation to both endpoints of a dash -- the dash's position along the edge (tangential) never
+changes, only its distance from the edge (perpendicular).
+
+Per-segment desync: each individual dash (not just each edge) now gets its own phase via
+`World._pseudo_random01(axial, 101.0 + edge_index*7.0 + dash_index*13.3)`, baking the dash's own index into the
+salt -- so two dashes on the SAME edge ripple independently, not just two different edges, matching "different
+shoreline segments" literally rather than per-edge-only.
+
+Removed exports: `ripple_inset_fraction` (a ripple's distance from the edge is now a function of its own
+animation progress, not a fixed static setting) and `ripple_scroll_speed_px_s`/`ripple_pulse_speed`/
+`ripple_pulse_min` (replaced by `ripple_max_expand_px`, `ripple_cycle_speed`, `ripple_active_fraction`).
+
+**Updated tests**: replaced the `_pulse` checks with `_ripple_state` checks -- fully zero (not dimmed) outside the
+active window; `drift=0` at the very start of a window; `drift` reaches near `max_expand_px` by the window's end;
+alpha peaks near the window's middle rather than jumping on/off; periodic over one full cycle; a different
+`phase01` changes the state at the same instant (segments desync). Suite: 340/340, clean headless load.
+
+Re-verified visually (`--rendering-driver opengl3`, `ripple_cycle_speed`/`ripple_max_expand_px`/
+`ripple_active_fraction` bumped in the probe only for a clearer diff over a short wait): two screenshots 636ms
+apart, zoomed on a single water hex's shoreline, show a different subset of dashes lit along the edges each
+frame (some faded that were visible before, others newly appeared) -- the appear/fade behavior is clearly live;
+the pure `_ripple_state` math above is what's actually verified for the inward-wash-not-sideways-scroll claim,
+since that distinction is finer than this screenshot pairing can show by eye at normal dash speeds.
+
+## 2026-10-29 — Ripples now start past GridOutline's dark cliff line, not underneath it
+
+The user asked for ripples on the 3 north-facing edges (N/NW/NE) to start beyond/below GridOutline's existing
+dark "shore_line" cliff cue, not underneath/overlapping it.
+
+Added `_cliff_inset_px(edge_index)` to `shoreline_ripple_overlay.gd`: 0 on any edge without a cliff line (no
+`_grid_outline` wired, or the edge isn't one of GridOutline's 3 camera-facing shore indices); on a cliff edge,
+returns `shore_line_width` (straight north) or `shore_line_width_diagonal` (NW/NE) -- read from a live
+`_grid_outline` node reference, not a duplicated magic number, so retuning the cliff line's width in the
+Inspector keeps the ripple's start position correct automatically. `_draw()` now adds this as a constant base
+offset on top of each ripple's own animated inward drift (`drift = inward_dir * (base_inset + state.y)`), so a
+cliff-edge ripple's full travel range is `[cliff_width, cliff_width + ripple_max_expand_px]` instead of
+`[0, ripple_max_expand_px]` -- it still appears, washes inward, and fades exactly as before, just starting from
+further in. `configure()` gained an optional third `grid_outline: Node2D = null` parameter (defaults to the old,
+pre-this-feature behavior if omitted); `world.gd` now passes its own `grid_outline` node through.
+
+Also took the opportunity to delete `_EDGE_NEIGHBOR_OFFSETS`, the local 6-entry copy of GridOutline's
+`_ALL_EDGE_NEIGHBOR_OFFSETS` table (added 2026-10-29, duplicated at the time specifically so this file had no
+GridOutline dependency) -- now that `_cliff_inset_px` has made that dependency real and intentional anyway,
+keeping two independently-derived copies of the same geometry table serves no purpose and is exactly the kind of
+drift risk this project avoids elsewhere (`GridOutline`/`HexSelection`'s shared `grid_size`,
+`PlumeOverlay`/`HeadContourOverlay`'s shared triangle-lattice offsets). `_is_shore_edge` now reads
+`GridOutline._ALL_EDGE_NEIGHBOR_OFFSETS` directly.
+
+**Updated tests**: the now-redundant standalone geometric check of the deleted local table was removed (the
+identical check already exists against `GridOutline._ALL_EDGE_NEIGHBOR_OFFSETS` in
+`_test_grid_outline_water_interior_edges`, and that table is now literally the same one this file uses, not a
+separate derivation to re-verify). Added direct `_cliff_inset_px` checks: 0 on all 3 non-cliff edges even with a
+`GridOutline` wired; the straight-north edge's inset exactly matches a test `GridOutline` instance's own
+`shore_line_width`; both diagonal edges match `shore_line_width_diagonal` instead. Suite: 343/343, clean headless
+load.
+
+Re-verified visually (`--rendering-driver opengl3`, cliff line widths exaggerated to 10px/8px and ripple timing
+forced to fully-visible in the probe only, so the effect is unambiguous at this zoom): a screenshot of a water
+cell with real land to its north and northwest shows the dark cliff lines on those two edges with the pale
+ripple dashes clearly sitting past them, not under them -- while the plain grass-bordering edges (no cliff line
+there) still show ripples starting right at the true edge, unchanged from before this amendment.
+
+## 2026-10-29 — Slow-moving cloud shadows (new overlay, world-space, not per-hex)
+
+The user asked for slow-moving cloud shadows, explicit about the architecture: "a world-space overlay covering
+multiple hexes, rather than shading individual tiles."
+
+Added `scripts/rendering/cloud_shadow_overlay.gd` (new `CloudShadowOverlay` node in `scenes/main.tscn`, right
+after `ShorelineRippleOverlay`, before `Features`) + `scripts/rendering/shaders/cloud_shadow.gdshader`. Literally
+ONE static rect, sized once to the map's own bounding box plus a margin, covers the whole map in a single draw
+call -- not one shape per hex. All of the actual cloud shape/motion lives in the fragment shader, sampling a
+fractal value-noise field (`hash12` -> `value_noise` -> 4-octave `fbm`, same hash-based "no texture lookup, no
+RNG to manage" family as `water_shimmer.gdshader`'s glints) in WORLD space via the same `world_pos` vertex-shader
+varying pattern used there -- the noise field is one continuous surface under the whole map, so a cloud drifting
+across never restarts or seams at a hex boundary, and critically was never evaluated "per tile" at all: the GPU
+just paints whatever the noise function says at each pixel's own world position, regardless of which (if any)
+hex that pixel happens to be over. Motion is `world_pos + cloud_speed_px_s * TIME` fed into the noise -- the
+rect itself never moves or resizes; the apparent drift is entirely the noise coordinates scrolling.
+
+**Efficiency note, not just a style choice:** unlike every other animated overlay in this project,
+`cloud_shadow_overlay.gd` does NOT call `queue_redraw()` every frame. Its one rect's shape never changes, and a
+`ShaderMaterial`'s `TIME`-driven fragment code is re-evaluated by the GPU every rendered frame regardless of
+whether the CPU reissues draw commands -- `queue_redraw()` is only needed when the draw commands THEMSELVES must
+change each frame (true for `FlowOverlay`'s dash positions and `ShorelineRippleOverlay`'s inset/alpha, computed
+in GDScript from `_time`; not true here, or for `WaterShimmerOverlay`'s static hex polygons, whose glint is 100%
+GPU-shader-driven too).
+
+**Layering, chosen deliberately for the brief's §6 guardrail** (ambient mood must never obscure critical
+simulation information): placed after `ShorelineRippleOverlay` but before `Features` in the scene tree, so a
+cloud shadow dims the ground/grid/water plane but renders UNDER tree/rock/decal sprites and under every x-ray
+data overlay (`GeologyOverlay`/`HeadContourOverlay`/`PlumeOverlay`/`FlowOverlay`, all later in the tree) --
+confirmed directly in the visual verification below (a probe run with `cloud_coverage=1.0` and a fully opaque
+color replaced every grass/sand/water tile with solid color while every tree, rock, flower, and the well/
+receptor markers stayed completely unaffected on top of it). Always visible, NOT x-ray-gated, same reasoning as
+`water_shimmer_overlay.gd`: ambient-only, never simulation data.
+
+Sliders (`memory/feedback_expose_visual_tuning.md`): `cloud_color` (including alpha -- how dark a cloud's
+densest point gets), `cloud_scale` (noise frequency -- smaller clouds need a larger value), `cloud_speed_px_s`
+(drift velocity, a `Vector2` so direction and speed are one setting), `cloud_coverage` (how much of the sky is
+in shadow), `cloud_softness` (edge blur of a cloud's silhouette). Defaults are deliberately slow/subtle
+(`cloud_speed_px_s = (6, 2.5)`, `cloud_coverage = 0.45`) per the user's explicit "slow-moving" ask.
+
+**New tests** (`tests/run_tests.gd`, `_test_cloud_shadow_overlay`): the noise shader itself has no
+headless-testable signature (same "drawn, not tested headlessly" scope as every GPU noise effect in this
+project), but the bounding-rect geometry it's painted onto is pure and fully tested: an empty position list
+produces an empty `Rect2` rather than crashing; a known 3-point set produces a rect whose corners are exactly the
+tightest bounding corners minus/plus the margin (not padded more than asked); every point in the set lands inside
+the result; and, on a real generated map, every actual cell center lands inside the configured bounds -- the
+whole point of a single map-spanning rect is that a cloud can cross any hex, so there must be no gap at the
+map's own edge. Suite: 351/351, clean headless load.
+
+Re-verified visually (`--rendering-driver opengl3`, zoomed far out to see the whole map in one frame, coverage/
+color boosted in the probe only for a clear screenshot at normal map-art contrast -- the real defaults are
+intentionally subtler). First pass with `cloud_coverage=1.0` and an opaque magenta color confirmed the
+layering claim above (ground replaced, decorations untouched). Second pass at a realistic-but-visible strength
+(`cloud_coverage=0.55`, a dark blue-grey at 0.8 alpha) showed a soft diagonal dark band crossing several hexes
+with no visible seam at any tile edge; a second screenshot ~2.6 real seconds later shows that band had visibly
+shifted and reshaped -- confirming both the "multiple hexes, one continuous surface" architecture and genuine
+drift over time.
+
+2026-10-29 -- Cloud shadows moved above Features (trees/rocks/decals)
+-----------------------------------------------------------------------
+User's ask: "the cloud shadows need to be the top layer - on top of trees, decals, rocks, etc." The initial
+placement (right after ShorelineRippleOverlay, before Features) deliberately kept clouds under tree/rock
+silhouettes per the brief's §6 "never obscure critical simulation information" guardrail -- but the user wants
+the visual effect of a cloud passing over everything on the ground, decorations included.
+
+Fix: in scenes/main.tscn, moved the CloudShadowOverlay node (and the still-unwired CloudShadowOverlay2 node
+alongside it -- see note below) to right after Features in the scene tree, instead of right before it. It is
+now drawn on top of trees/rocks/decals, but still BELOW every x-ray data overlay (GeologyOverlay,
+HeadContourOverlay, PlumeOverlay, FlowOverlay, HexSelection, DebugOverlay) -- preserving the one part of the
+original guardrail that still matters: ambient mood must never obscure simulation data, but it's fine for it to
+darken decorative silhouettes, which is exactly what the user asked for. Updated cloud_shadow_overlay.gd's
+header comment to match. No shader or script logic changed -- this was purely a node-order change.
+
+Note found while making this change: the scene has two CloudShadowOverlay nodes ("CloudShadowOverlay" and
+"CloudShadowOverlay2") with identical parameters, but world.gd only ever does
+`@onready var cloud_shadow_overlay: Node2D = $CloudShadowOverlay` and only configures that one node -- the
+second one is never configured, so its `_bounds_rect` stays `Rect2()` and its `_draw()` returns immediately
+without drawing anything (dead/inert). Left as-is since removing or wiring it up wasn't asked for; flagged to
+the user in the chat response.
+
+Suite: 351/351, clean headless load. No new automated test needed (pure node-reorder, no new behavior to
+assert beyond what's already covered); re-verified by inspection that Features is now listed before
+CloudShadowOverlay and CloudShadowOverlay comes before DebugOverlay in scenes/main.tscn.
+
+2026-10-29 -- Rainfall events
+-----------------------------------------------------------------------
+User's ask: "add rainfall events: Clouds covers all tiles. Visible drops/short lines. Rain should produce
+expanding circular ripples on water tiles, wet ground darkens, tree sway intensifies, and the ambient sound
+changes (lateR)." Ambient sound explicitly deferred by the user ("later") -- not attempted this pass.
+
+Architecture: ONE new node, RainController (rain_controller.gd, extends Node, no drawing of its own), owns
+just the timing/intensity state machine -- a real-time ramp 0 -> 1 -> 0 per event (_intensity_for, a pure,
+tested function: fade in over fade_s, hold at 1.0, fade out over fade_s; degrades to a triangular pulse for
+a short event where fade-in and fade-out overlap, rather than snapping to a plateau that doesn't exist).
+Between events it waits a random real-time gap in [min_interval_s, max_interval_s] (auto_events); force_rain
+is a one-shot Inspector trigger for testing without waiting on the schedule, same "expose it, don't hand-tune
+blind" practice as the rest of this project (memory/feedback_expose_visual_tuning.md). Every reactive system
+reads RainController.intensity directly off a shared reference every frame -- the same "configure once, read
+a shared data source every frame" pattern GridOutline/HexSelection already use for grid_size -- rather than a
+signal fan-out, since every consumer already gets configured with references to shared nodes (ground, model,
+grid_outline) this same way.
+
+Each of the user's five asks maps to one existing or new piece, deliberately NOT a pile of new overlay classes:
+- "Clouds covers all tiles": CloudShadowOverlay (already built 2026-10-29 for ordinary drifting clouds) gained
+  set_rain_intensity(t), lerping cloud_coverage/cloud_color toward new storm_coverage (default 1.0 -- the
+  user's literal "all tiles") / storm_color exports. A storm is this same mechanism pushed to its extreme,
+  not a second cloud system.
+- "Visible drops/short lines": a new RainOverlay (CanvasLayer + full-viewport ColorRect + rain_streaks.gdshader).
+  Screen-space, not world-space, like the HUD -- streak size/speed must read the same regardless of camera
+  zoom. The shader hashes the screen into per-pixel-sized vertical "lanes," each either empty or carrying one
+  falling streak (FRAGCOORD-based, so it's resolution-independent and needs no vertex-stage world_pos). Hit one
+  real Godot shader-language constraint while wiring this up: an early `return` inside fragment() is a SHADER
+  ERROR ("Using 'return' in the 'fragment' processor function is incorrect") -- fixed by replacing the
+  early-exit with a multiplicative `lane_mask` folded into the final alpha instead.
+- "Expanding circular ripples on water tiles": a new RainRippleOverlay (Node2D), a DIFFERENT effect from
+  shoreline_ripple_overlay.gd's dashed shore-edge wash -- plain growing/fading rings spawned at random jittered
+  points across the water cells themselves (not the shoreline), at a rate scaled by intensity. CPU-driven (ripple
+  birth/death times and positions are decided on the CPU), so unlike CloudShadowOverlay this DOES need a
+  per-frame queue_redraw() -- same category as FlowOverlay/ShorelineRippleOverlay. _ripple_radius/_ripple_alpha
+  are pure linear growth/fade curves, tested headlessly; the random spawning itself is only verified visually.
+- "Wet ground darkens": no new overlay at all -- World._apply_rain_effects() lerps Ground's own `modulate`
+  from WHITE toward a new wet_ground_tint export as intensity rises. There was no drawing of its own to add; an
+  existing TileMapLayer property was the whole job.
+- "Tree sway intensifies": tree sway materials were never kept around after _build_features() (unlike the
+  geology/well exports, there was no live-tuning hook for them at all before this). Fixed minimally: every
+  tree's sway ShaderMaterial (and its shadow's) is now appended to _tree_sway_materials/_tree_shadow_sway_materials
+  as it's built, and _apply_rain_effects() pushes a rain-boosted sway_amount_px/sway_speed to all of them each
+  frame (World._boosted_for_rain, a pure lerp-to-multiplier helper, tested). As a side effect, ordinary
+  Inspector edits to tree_sway_amount_px/tree_sway_speed now also take effect live during play, the same
+  "live-tuning" fix _refresh_geology_parameters already established for the K/porosity sliders -- not a new
+  concept, just extended to a value that had been missed.
+
+Suite: 382/382 (31 new assertions: RainController's intensity ramp shape including the short-event/zero-fade/
+zero-duration edge cases, RainRippleOverlay's radius/alpha curves and configure()/spawn wiring against a live
+fake RainController, World._boosted_for_rain's clamping, and World._apply_rain_effects actually reaching real
+tree materials and Ground's modulate on a built map). Clean headless load.
+
+Verified with a real --rendering-driver opengl3 screenshot: forced a rain event straight into its held
+(intensity == 1.0) plateau rather than waiting on fade_s/min_interval_s real seconds (same "jump to the
+extreme, confirm the mechanism" approach as every other shader-driven overlay here). The screenshot shows
+diagonal white streaks covering the whole viewport, a fully overcast dark sky, visibly darker/cooler ground,
+and one ripple ring already growing on the river -- all simultaneously, with trees/features/HUD still drawn
+correctly on top/behind as expected. A second screenshot, intended ~2.5 real seconds later, instead landed
+~422 real seconds later (this dev machine's opengl3 software path renders this many simultaneous shaders very
+slowly under the scripted probe) -- which incidentally became a second, unplanned confirmation: RainController's
+own real-time duration (60s) had elapsed by then, so intensity had correctly fallen back to 0, and every
+reactive system (cloud coverage, ground tint, streaks, ripples) had cleanly reverted to baseline right along
+with it, with nothing left stuck in a "rained on forever" state.
+
+Noted, not fixed: the same pre-existing dead "CloudShadowOverlay2" node flagged in the entry above is still
+present and still unwired -- untouched again this pass.
+
+2026-10-29 -- Rain streaks were falling bottom-to-top; added a direction handle; removed the dead CloudShadowOverlay2
+-----------------------------------------------------------------------
+User report: "the [rain] is failing from the bottom to the top. Is there a way to change its direction (add
+handle). We also have two CloudShadowOverlay which both seem to have the same options."
+
+Rain direction bug: rain_streaks.gdshader computed each lane's falling position as
+`mod(p.y + fall_speed_px_s * TIME + phase, tile_height_px)`. Worked through on paper: for a fixed screen
+pixel to stay lit as TIME advances, its own p.y has to counter-shift by -fall_speed_px_s*TIME to stay inside
+the active window -- meaning the lit position actually drifts toward SMALLER p.y (up the screen, since Y
+increases downward) as TIME grows, regardless of fall_speed_px_s's own sign. Fixed by subtracting instead of
+adding: `mod(p.y - fall_speed_px_s * TIME + phase, tile_height_px)`. Verified with a lightweight probe
+(rain_overlay.gd instantiated alone, not the whole main.tscn -- the full-scene rain probe from the entry above
+took ~7 real minutes per pair of screenshots on this machine, too slow to re-run for a one-line sign check) --
+two screenshots ~0.35 real seconds apart show the same streak clusters clearly shifted DOWN-and-slightly-right
+(wind drift) between frames, not up.
+
+Direction handle: fall_speed_px_s's Inspector range was hint_range(100, 3000) -- positive-only, so flipping
+direction required editing the shader/script. Widened to hint_range(-3000, 3000) in both the shader and
+rain_overlay.gd's matching @export_range: the sign now IS the fall direction (positive = down, the normal
+case; negative = up), draggable from the Inspector, same "expose it, don't hand-tune blind" practice as the
+rest of this project.
+
+CloudShadowOverlay2: confirmed (again) that world.gd only ever wires up `$CloudShadowOverlay` -- the second
+node was always dead weight, now actually deleted from scenes/main.tscn instead of just flagged.
+
+Suite: 382/382 (unchanged -- this was a sign fix, a range widen, and a dead-node deletion, nothing new to
+assert). Clean headless load.
+
+2026-10-29 -- Fixed extreme tree shaking at the start/end of a storm
+-----------------------------------------------------------------------
+User report: "at the beginning and end of the storm/rainfall events the trees shake extremely, please fix."
+
+Root cause: tree_sway.gdshader computes each tree's lean as `sin(TIME * sway_speed + phase)`, where TIME is
+the engine's total elapsed time since startup -- already large (seconds to minutes) by the time any storm
+happens. _apply_rain_effects() (added for rainfall events, entry above) was pushing a rain-boosted sway_speed
+to every tree's ShaderMaterial every single frame while RainController.intensity was fading in/out. Since
+sway_speed multiplies that large TIME inside the sine, even a TINY per-frame change in sway_speed produced a
+LARGE jump in the sine's argument -- e.g. TIME=600s and a sway_speed change of just 0.004 between two
+consecutive frames shifts the argument by ~2.4 radians, nearly half a full cycle, in one frame. That reads as
+violent, chaotic shaking, not a smooth wind-speed-up -- and explains exactly the symptom reported: it only
+happens while intensity (and so sway_speed) is actively changing, i.e. the fade-in/fade-out windows at the
+start/end of an event, and is absent mid-storm once intensity holds steady at 1.0.
+
+Fix: stopped boosting sway_speed during rain entirely -- removed the rain_tree_sway_speed_boost export and the
+per-frame `sway_speed` shader-parameter push from _apply_rain_effects(). Only sway_amount_px (amplitude) is
+still rain-boosted; amplitude only scales the sine's OUTPUT, so varying it continuously every frame is
+perfectly smooth -- no argument discontinuity, because TIME never multiplies it. "Tree sway intensifies"
+(the original ask) is still satisfied: bigger-amplitude sway at a constant frequency reads as windier just
+fine, without needing the frequency itself to change.
+
+General lesson, worth remembering for any future TIME-based oscillator in this project: a uniform that
+multiplies TIME inside a trig function must never be changed continuously at runtime from script -- doing so
+retroactively reinterprets the entire elapsed history, not just the behavior going forward. If a speed-up
+effect like this is ever wanted again, it needs a CPU-tracked accumulated phase (integrate speed*delta into a
+running total each frame, pass THAT to the shader instead of raw TIME*speed) rather than a live uniform.
+
+Suite: 382/382 (no new assertions -- this was a removal, not new behavior to cover; the existing
+_test_world_rain_effects assertion on sway_amount_px boosting still passes). Clean headless load.
+
+## 2026-10-29 — Sandbox toggle: `procedural_generation` export + World.gd made `@tool`
+
+User's ask: open the map up so they can hand-build an initial level and try terrain settings, instead
+of only ever getting the procedurally generated one.
+
+Everything about Ground (TileMapLayer) and Features (trees/rocks/decals) was previously built from
+scratch every single run, in World._ready(): _build_terrain() calls ground.clear() and repaints every
+cell from GridModel's elevation field, and _build_features() wipes and rebuilds Features the same way.
+Nothing hand-placed in the editor could ever survive pressing Play.
+
+Fix has two parts:
+
+1. `@export var procedural_generation: bool = true` (world.gd). True (default, unchanged behavior) ->
+   _build_terrain()/_build_features() run exactly as before. False -> both are skipped at runtime, so
+   whatever cells you painted on Ground / children you placed under Features while editing the scene
+   are exactly what the running game shows.
+2. World.gd is now `@tool` (first line of the script), purely so _build_tileset() can also run while
+   editing the scene, not just at runtime -- that's the one thing required for Ground to actually HAVE
+   a TileSet while the editor is open, which is what lets Godot's own hex tile-painting panel work on
+   it at all. _ready() returns immediately after _build_tileset() when Engine.is_editor_hint() is true:
+   no GridModel, HUD, or overlay setup ever runs while editing, only the tileset build. _process() and
+   _unhandled_input() got the same Engine.is_editor_hint() guard as cheap insurance, even though plain
+   Node callbacks aren't expected to fire in the editor anyway. Every exported setter that touches
+   _model (sand_k_m_s, well_axial, ...) was already null-guarded, so they're harmless while editing too
+   -- _model only gets created in the runtime branch.
+
+Water-dependent overlays (water_shimmer_overlay, shoreline_ripple_overlay, rain_ripple_overlay) used to
+get their water-cell list from `_river_cells` (the procedurally generated river path), which would be
+empty for a hand-painted lake. Replaced with `_water_cells()`, which reads water cells straight off
+Ground's actually-painted tiles (`get_cell_source_id(offset) == TERRAIN_WATER`) -- works identically
+whether Ground was procedurally painted or hand-painted, since `_build_tileset()` always keys each
+terrain's TileSet source id to the matching TERRAIN_* constant either way.
+
+minimal_test_mode is a separate, orthogonal toggle (Test B anchor isolation) and is untouched by this.
+
+Verified: 382/382 tests still pass (headless, Engine.is_editor_hint() is false there, so this is the
+procedural_generation=true/unchanged path); clean `--headless --quit` boot; clean
+`--headless --editor res://scenes/main.tscn --quit` boot too (exercises the new editor-hint _ready()
+branch with no script errors).
+
+## 2026-10-29 — Sandbox follow-ups: scenario markers always placed; data-driven `sandbox_features`
+
+Two follow-ons to the sandbox toggle above, both from the same conversation.
+
+**Scenario markers.** `_add_scenario_markers()` (source/well/receptor) was called from inside the same
+procedural block in `_build_features()` as the random tree/rock/decal pass, so turning
+`procedural_generation` off silently hid them too -- wrong, since they're positioned from fixed exports
+(`source_axial`/`well_axial`/`receptor_axial`), not randomness. Restructured so the children-clear step
+and the procedural loop are each individually gated on `procedural_generation`, while
+`_add_scenario_markers()` always runs (outside minimal_test_mode). A hand-built sandbox level now still
+shows exactly where the simulation's source/well/receptor are.
+
+**`sandbox_features`.** User found hand-dragging a separate `Sprite2D` per tree/rock/decal under
+`Features` too tedious and imprecise (no snapping aid against the hex grid). Added
+`scripts/rendering/feature_placement.gd`, a plain `Resource` with four fields: `axial`, `texture`,
+`is_tree`, `nudge`. `World.sandbox_features: Array[FeaturePlacement]` is a new export -- only consulted
+when
+`procedural_generation` is false. `_add_sandbox_features()` places each entry through the *exact same*
+anchor code the procedural pass already uses (`_add_tree_feature` for `is_tree == true`, `_add_feature`
+otherwise), so a hand-placed feature lands pixel-exact on its cell -- no manual `Sprite2D`, no
+eyeballing. No scatter, same convention as the scenario markers: a chosen cell means that cell,
+dead-center. An entry with no texture set is skipped, not a crash (an empty array slot the user hasn't
+filled in yet).
+
+Covered by `_test_world_sandbox_mode` (tests/run_tests.gd): a rock placement lands exactly at
+`cell_centre_in_features()`, a tree placement gets the same contact-shadow + sway wiring
+`_test_tree_sway_and_shadow` already checks for procedural trees, an empty-texture entry doesn't crash,
+and scenario markers are present. Suite: 386/386. Clean headless boot and clean
+`--headless --editor ... --quit` boot (the new
+`Array[FeaturePlacement]` export resolves fine in the editor's Inspector).
+
+## 2026-10-29 — DebugOverlay's axial labels now visible while editing, not just at runtime
+
+User feedback: picking a texture in a sandbox_features entry "doesn't seem to connect/show up" --
+correct, nothing in that whole pipeline runs until you press Play (see the @tool comment in world.gd).
+But the actual blocker was worse than that: there was no way to even know WHICH axial (q, r) to type
+into a sandbox_features entry while still editing -- unlike Ground, which you paint by clicking
+directly (no coordinate needed), a hand-placed feature needs you to already know its cell's axial
+value.
+
+Fix: made hex_debug_overlay.gd `@tool` too (its only virtual is _draw(), nothing else to guard) and
+had World's editor-hint _ready() branch call debug_overlay.configure(...) and force it visible,
+independent of show_debug_overlay's runtime value. Its magenta crosshair + "%d,%d" axial label at
+every cell center (already built for comparing procedural anchors, per its own header comment) is now
+exactly what you read off to fill in a FeaturePlacement's `axial` field.
+
+Still true, and worth being explicit about: no sandbox_features entry actually appears in the viewport
+while editing -- that part is still Play-only. This fix only solves "what coordinate do I type", not
+"preview the placement live" (that would need Resource.changed-signal wiring to react to Inspector
+edits inside the typed array, a meaningfully bigger feature nobody's asked for yet).
+
+Verified: 386/386 tests pass; clean `--headless --quit` boot; clean
+`--headless --editor res://scenes/main.tscn --quit` boot.
+
+## 2026-10-29 — `feature_placement.gd` needs `class_name` after all
+
+User feedback: clicking the "New Resource" dropdown on an empty `sandbox_features` array slot showed
+~300 generic options with no "New FeaturePlacement" shortcut anywhere. Root cause: this script had no
+`class_name`, so it was never registered as a named type at all -- the editor's resource picker can
+only offer a named shortcut, or let you search by name in the "Create New Resource" dialog, for a type
+it actually knows the name of. An unnamed custom Resource script doesn't show up in that dialog under
+any discoverable name, which is exactly the dead end the user hit.
+
+Re-added `class_name FeaturePlacement`. The earlier "Could not find type FeaturePlacement in the
+current scope" parse error (which was the reason it got dropped in the first place) turned out NOT to
+be a real class_name/headless incompatibility -- it was caused by world.gd referencing
+`Array[FeaturePlacement]` with no explicit `const FeaturePlacement = preload(...)` fallback of its own
+at the time. Once that const exists (added in the sandbox_features entry above, and kept even after
+re-adding class_name here), a GDScript local const always resolves ahead of a global class lookup, so
+the type reference no longer depends on whether the project's (gitignored, regenerable)
+`.godot/global_script_class_cache.cfg` happens to already exist. Verified directly: deleted that cache
+file to simulate a fresh clone/first-ever headless run, then re-ran `--headless --script
+res://tests/run_tests.gd` cold -- still 386/386, no parse errors. class_name and an explicit local
+const are not in tension; keeping both is strictly more robust than either alone (editor-friendly name
++ cache-independent headless compilation).
+
+Verified: 386/386 tests pass (cold, cache deleted); clean `--headless --quit` boot; clean
+`--headless --editor res://scenes/main.tscn --quit` boot.

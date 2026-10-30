@@ -51,6 +51,18 @@ const _SHORE_EDGE_INDICES: Array[int] = [3, 4, 5] # NW, N, NE
 const _SHORE_EDGE_NEIGHBOR_OFFSETS: Array[Vector2i] = [Vector2i(-1, 0), Vector2i(0, -1), Vector2i(1, -1)] # must stay index-matched to _SHORE_EDGE_INDICES
 const _SHORE_NORTH_EDGE_INDEX := 4 # the straight-north entry of _SHORE_EDGE_INDICES -- gets shore_line_width, not shore_line_width_diagonal
 
+## All 6 edges' neighbor offsets, index-matched to hex_points() edge order
+## (edge i runs corner i -> corner i+1) -- same derivation as
+## _SHORE_EDGE_NEIGHBOR_OFFSETS above (each edge's outward direction matched
+## to the HexMath neighbor offset pointing the same way), just not restricted
+## to the 3 north-facing edges. Used only for the water-interior-edge check
+## below, which has no camera-facing restriction (water seams, unlike the
+## shore cliff illusion, aren't angle-dependent). Verified geometrically, not
+## just asserted -- see _test_grid_outline_water_interior_edges.
+const _ALL_EDGE_NEIGHBOR_OFFSETS: Array[Vector2i] = [
+	Vector2i(1, 0), Vector2i(0, 1), Vector2i(-1, 1), Vector2i(-1, 0), Vector2i(0, -1), Vector2i(1, -1),
+]
+
 var _ground: TileMapLayer
 var _cells: Array[Vector2i] = [] # axial (q, r), converted to Godot offset coords when drawing
 
@@ -98,6 +110,19 @@ func _is_shore_edge(axial: Vector2i, offset: Vector2i, edge_index: int) -> bool:
 func _shore_edge_width(edge_index: int) -> float:
 	return shore_line_width if edge_index == _SHORE_NORTH_EDGE_INDEX else shore_line_width_diagonal
 
+## True iff BOTH this cell and the neighbor across edge_index are real,
+## placed water -- an interior seam within one connected water body, not a
+## real boundary of anything (unlike a shore edge, which separates two
+## genuinely different surfaces). Uses the full edge-direction table, not
+## GridOutline's own 3-edge shore subset, since a water-water edge can be on
+## any of the 6 sides, not just the camera-facing north ones.
+func _is_water_interior_edge(axial: Vector2i, offset: Vector2i, edge_index: int) -> bool:
+	if not _is_water(offset):
+		return false
+	var neighbor_axial := axial + _ALL_EDGE_NEIGHBOR_OFFSETS[edge_index]
+	var neighbor_offset := GodotHexOffset.axial_to_offset(neighbor_axial)
+	return _is_water(neighbor_offset)
+
 func _draw() -> void:
 	if _ground == null:
 		return
@@ -106,6 +131,8 @@ func _draw() -> void:
 		var offset := GodotHexOffset.axial_to_offset(axial)
 		var center: Vector2 = to_local(_ground.to_global(_ground.map_to_local(offset)))
 		for i in range(6):
+			if _is_water_interior_edge(axial, offset, i):
+				continue # open connected water -- no grid line across it (user's ask: water should read as one seamless surface, not a lattice of individual hexes)
 			var a: Vector2 = center + outline[i]
 			var b: Vector2 = center + outline[(i + 1) % 6]
 			if _is_shore_edge(axial, offset, i):

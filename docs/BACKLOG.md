@@ -30,3 +30,20 @@ toggles and "per-cell inspector" idea). Two things make this more than "the flow
 ~6-9), revisit this. At that point `World.cell_info()` (already built, 2026-10-20) is the natural per-cell data
 source to gate by a new `known`/`confidence` field, and `flow_overlay.gd`'s arrow-drawing code is directly
 reusable for the flow layer inside the new view -- just don't always-show every cell any more.
+
+## Multi-level save/load (level 1, level 2, ...)
+
+Raised by the user 2026-10-30, after the sandbox toggle (`World.procedural_generation`) and `sandbox_features`
+landed (`docs/DECISIONS.md`'s 2026-10-29 entries). Right now a hand-built level is just whatever state is sitting
+in `scenes/main.tscn` -- painted `Ground` cells, `sandbox_features`, and the scenario/geology exports are all
+serialized together in that one scene file. There's no level-select, no file-per-level convention.
+
+For now the recommended path is the cheap one: **Scene -> Save Scene As...** to snapshot the current state into
+`scenes/levels/level_1.tscn`, repeat per level, and use F6 (run current scene) to test a specific one directly.
+No code needed.
+
+The scalable alternative -- worth building once there are actually several levels and editing them in lockstep
+becomes painful -- is extracting level content (painted cells + `sandbox_features` + the scenario/geology
+exports) into its own resource (`.tres`) that one shared scene loads at runtime by path/name, plus a level-select
+screen. That's a real save/load system (serializing `TileMapLayer` cells to/from a resource), not a file copy, so
+don't start it until the duplicate-scene approach actually hurts.

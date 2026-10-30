@@ -14,6 +14,13 @@ const FlowOverlay = preload("res://scripts/rendering/flow_overlay.gd")
 const PlumeOverlay = preload("res://scripts/rendering/plume_overlay.gd")
 const GeologyOverlay = preload("res://scripts/rendering/geology_overlay.gd")
 const HeadContourOverlay = preload("res://scripts/rendering/head_contour_overlay.gd")
+const WaterShimmerOverlay = preload("res://scripts/rendering/water_shimmer_overlay.gd")
+const MoodLighting = preload("res://scripts/rendering/mood_lighting.gd")
+const ShorelineRippleOverlay = preload("res://scripts/rendering/shoreline_ripple_overlay.gd")
+const CloudShadowOverlay = preload("res://scripts/rendering/cloud_shadow_overlay.gd")
+const RainController = preload("res://scripts/rendering/rain_controller.gd")
+const RainRippleOverlay = preload("res://scripts/rendering/rain_ripple_overlay.gd")
+const FeaturePlacement = preload("res://scripts/rendering/feature_placement.gd")
 
 func _init() -> void:
 	var failures := 0
@@ -43,6 +50,15 @@ func _init() -> void:
 	failures += _test_world_cell_info()
 	failures += _test_hex_selection_format_cell_info()
 	failures += _test_flow_overlay_vector()
+	failures += _test_flow_overlay_dash_segments()
+	failures += _test_water_shimmer_overlay()
+	failures += _test_mood_lighting()
+	failures += _test_grid_outline_water_interior_edges()
+	failures += _test_shoreline_ripple_overlay()
+	failures += _test_cloud_shadow_overlay()
+	failures += _test_rain_controller_intensity_curve()
+	failures += _test_rain_ripple_overlay()
+	failures += _test_world_rain_effects()
 	failures += _test_plume_overlay_fraction()
 	failures += _test_plume_overlay_clip()
 	failures += _test_plume_overlay_triangle_key_order_independent()
@@ -72,6 +88,8 @@ func _init() -> void:
 	failures += _test_world_minimal_test_mode()
 	failures += _test_hex_selection_matches_grid_outline()
 	failures += _test_feature_overlap_depth_rule()
+	failures += _test_tree_sway_and_shadow()
+	failures += _test_world_sandbox_mode()
 	failures += _test_rocky_terrain_boulder_coupling()
 	failures += _test_mountains_concentrate_north()
 	failures += _test_major_feature_scatter()
@@ -1121,6 +1139,148 @@ func _test_feature_overlap_depth_rule() -> int:
 	world.free()
 	return f
 
+## Wind-sway trees + their contact shadow (2026-10-27, user ask: "a light
+## back and forth to the trees... and a shadow underneath that interacts
+## with the movement"). Checks the wiring _add_tree_feature builds, not the
+## shader math itself (Geometry2D-style per-pixel assertions don't apply to
+## a GPU vertex shader) -- i.e. that _draw order, material, and per-tree
+## phase sync/desync are actually correct, since those are exactly the parts
+## a future refactor could silently break without any visual symptom in the
+## editor (a shader with the wrong material still "looks like a tree" at
+## TIME=0).
+func _test_tree_sway_and_shadow() -> int:
+	var f := 0
+	var world = _make_world()
+
+	var anchor := Vector2(World.TREES[0].get_width() / 2.0, World.TREES[0].get_height())
+	var root_a: Node2D = world._add_tree_feature(Vector2i(0, 4), World.TREES[0], anchor)
+	var root_b: Node2D = world._add_tree_feature(Vector2i(2, -3), World.TREES[0], anchor)
+
+	f += _check(root_a.get_child_count() == 2,
+		"a tree feature has exactly 2 children: the contact shadow and the tree sprite")
+
+	var shadow: Sprite2D = root_a.get_child(0)
+	var sprite: Sprite2D = root_a.get_child(1)
+	f += _check(sprite.texture == World.TREES[0],
+		"the tree sprite (still the texture passed in) is child index 1, drawn on top")
+	f += _check(shadow.texture != null and shadow.texture != World.TREES[0],
+		"the shadow is a separately generated texture, child index 0, drawn first/underneath")
+	f += _check(shadow.z_index == 0 and sprite.z_index == 0,
+		"neither shadow nor sprite gets its own z_index -- would break the depth/overlap rule's y-sort (see _test_feature_overlap_depth_rule)")
+	f += _check(shadow.position == Vector2.ZERO,
+		"the shadow's NODE position stays at the root's origin, tied with the sprite -- Y-sort reads this directly, so a southward node offset would sort the shadow in front of its own tree instead of behind it (the exact bug this guards against; the visual 'nudge down' lives in the shader's offset_px uniform, invisible to Y-sort)")
+
+	var sprite_mat: ShaderMaterial = sprite.material
+	var shadow_mat: ShaderMaterial = shadow.material
+	f += _check(sprite_mat != null and sprite_mat.shader == World.TREE_SWAY_SHADER,
+		"the tree sprite uses the canopy-sway shader")
+	f += _check(shadow_mat != null and shadow_mat.shader == World.TREE_SHADOW_SWAY_SHADER,
+		"the shadow uses its own (simpler, no-bend) sway shader")
+
+	var tree_phase: float = sprite_mat.get_shader_parameter("phase")
+	var shadow_phase: float = shadow_mat.get_shader_parameter("phase")
+	f += _check(is_equal_approx(tree_phase, shadow_phase),
+		"a tree's shadow shares its canopy's exact sway phase -- the shadow visibly tracks its own tree's movement")
+
+	var tree_amount: float = sprite_mat.get_shader_parameter("sway_amount_px")
+	var shadow_amount: float = shadow_mat.get_shader_parameter("sway_amount_px")
+	f += _check(shadow_amount < tree_amount and shadow_amount > 0.0,
+		"the shadow sways less than the canopy (a flat ground shadow shouldn't swing as wide as the crown), but still moves")
+
+	var root_b_sprite: Sprite2D = root_b.get_child(1)
+	var phase_b: float = (root_b_sprite.material as ShaderMaterial).get_shader_parameter("phase")
+	f += _check(not is_equal_approx(tree_phase, phase_b),
+		"two different cells' trees get different phases -- a forest doesn't sway in lockstep")
+
+	# Integration check: the normal map-generation pass (_build_features, run
+	# inside _make_world) must route every real tree through this same path,
+	# not just a directly-called test instance.
+	var any_real_tree_has_shadow := false
+	for root in world.features.get_children():
+		if root.get_meta("kind", "") != "feature":
+			continue
+		if root.get_child_count() < 2:
+			continue
+		var maybe_sprite: Sprite2D = root.get_child(1)
+		if World.TREES.has(maybe_sprite.texture):
+			any_real_tree_has_shadow = true
+			break
+	f += _check(any_real_tree_has_shadow,
+		"at least one naturally-generated tree (via _build_features, not a direct test call) also got a shadow")
+
+	root_a.free()
+	root_b.free()
+	world.free()
+	return f
+
+## Sandbox mode (user's 2026-10-29 ask): with procedural_generation off,
+## _build_features() must (a) place every sandbox_features entry pixel-exact
+## on its own cell via the same anchor code the procedural pass uses, (b)
+## skip an entry with no texture set rather than crash, and (c) still place
+## the scenario markers (source/well/receptor) -- those are fixed exports,
+## not procedural dressing, so a hand-built level must still show them.
+func _test_world_sandbox_mode() -> int:
+	var f := 0
+	var world = World.new()
+	world.minimal_test_mode = false
+	world.procedural_generation = false
+	var ground_node := TileMapLayer.new()
+	var features_node := Node2D.new()
+	world.add_child(ground_node)
+	world.add_child(features_node)
+	world.ground = ground_node
+	world.features = features_node
+
+	world._build_tileset()
+	world._model = GridModel.new(world.radius)
+	var bounds: Vector2 = world._model.elevation_range()
+	world._elevation_lo = bounds.x
+	world._elevation_hi = bounds.y
+	world._river_cells.clear()
+
+	var rock_placement := FeaturePlacement.new()
+	rock_placement.axial = Vector2i(2, -1)
+	rock_placement.texture = World.ROCKS[0]
+	rock_placement.is_tree = false
+
+	var tree_placement := FeaturePlacement.new()
+	tree_placement.axial = Vector2i(-2, 1)
+	tree_placement.texture = World.TREES[0]
+	tree_placement.is_tree = true
+
+	var empty_slot := FeaturePlacement.new() # texture left unset -- must not crash
+	var placements: Array[FeaturePlacement] = [rock_placement, tree_placement, empty_slot]
+	world.sandbox_features = placements
+
+	world._build_features()
+
+	var rock_root: Node2D = null
+	var tree_root: Node2D = null
+	for child in world.features.get_children():
+		for sprite in child.get_children():
+			var tex: Texture2D = (sprite as Sprite2D).texture
+			if tex == World.ROCKS[0]:
+				rock_root = child
+			elif tex == World.TREES[0]:
+				tree_root = child
+
+	f += _check(rock_root != null, "a sandbox_features entry places its sprite under Features")
+	f += _check(rock_root.position == world.cell_centre_in_features(Vector2i(2, -1)),
+		"a sandbox feature lands exactly on its cell's center -- no scatter, unlike procedural placement")
+	f += _check(tree_root != null and tree_root.get_child_count() == 2,
+		"is_tree routes through _add_tree_feature -- gets the contact shadow + sway material, same as a procedural tree")
+
+	var has_scenario_marker := false
+	for child in world.features.get_children():
+		if child.get_meta("kind", "") == "scenario":
+			has_scenario_marker = true
+			break
+	f += _check(has_scenario_marker,
+		"scenario markers (source/well/receptor) still get placed even when procedural_generation is false")
+
+	world.free()
+	return f
+
 ## TERRAIN_ROCKY couples a cell's ground art to whether it got a boulder
 ## feature (see _terrain_for's doc comment) -- confirms that coupling
 ## actually holds (every rocky cell's placed ground tile uses the rocky
@@ -1278,6 +1438,308 @@ func _test_grid_outline_shore_edges() -> int:
 		"the NW/NE diagonal shore edges use shore_line_width_diagonal, not the straight-north width")
 
 	outline.free()
+	world.free()
+	return f
+
+func _test_grid_outline_water_interior_edges() -> int:
+	var f := 0
+
+	var points := HexMath.hex_points(1.0)
+	var all_aligned := true
+	for i in range(6):
+		var edge_mid: Vector2 = (points[i] + points[(i + 1) % 6]) * 0.5
+		var neighbor_dir: Vector2 = HexMath.axial_to_pixel(GridOutline._ALL_EDGE_NEIGHBOR_OFFSETS[i], 1.0)
+		if edge_mid.normalized().dot(neighbor_dir.normalized()) < 0.99:
+			all_aligned = false
+	f += _check(all_aligned, "_ALL_EDGE_NEIGHBOR_OFFSETS entries actually point toward their matching edge, for all 6 edges")
+
+	var world = _make_world()
+	var outline := GridOutline.new()
+	outline.configure(world.ground, HexMath.cells_in_radius(world.radius))
+
+	# A small connected lake: three water cells in a row, with land on the
+	# far outside of each end.
+	var w0 := Vector2i(0, 0)
+	var w1 := Vector2i(0, 1)
+	var w2 := Vector2i(0, 2)
+	for axial in [w0, w1, w2]:
+		world.ground.set_cell(GodotHexOffset.axial_to_offset(axial), World.TERRAIN_WATER, Vector2i(0, 0))
+	world.ground.set_cell(GodotHexOffset.axial_to_offset(Vector2i(0, -1)), World.TERRAIN_GRASS, Vector2i(0, 0))
+	world.ground.set_cell(GodotHexOffset.axial_to_offset(Vector2i(0, 3)), World.TERRAIN_GRASS, Vector2i(0, 0))
+
+	# Edge index 1 ("S" in hex_points order) is the edge from w0 toward w1,
+	# and edge index 4 ("N") is the edge from w1 back toward w0 -- both sides
+	# of the same shared, fully-interior water/water seam.
+	f += _check(outline._is_water_interior_edge(w0, GodotHexOffset.axial_to_offset(w0), 1),
+		"w0's edge toward w1 (both water) IS a water-interior edge")
+	f += _check(outline._is_water_interior_edge(w1, GodotHexOffset.axial_to_offset(w1), 4),
+		"w1's edge back toward w0 (both water) IS a water-interior edge -- symmetric, not just one direction")
+	f += _check(not outline._is_water_interior_edge(w0, GodotHexOffset.axial_to_offset(w0), 4),
+		"w0's edge toward the land cell at (0,-1) is NOT a water-interior edge -- that's a real shore")
+	f += _check(not outline._is_water_interior_edge(w2, GodotHexOffset.axial_to_offset(w2), 1),
+		"w2's edge toward the land cell at (0,3) is NOT a water-interior edge")
+
+	outline.free()
+	world.free()
+	return f
+
+func _test_shoreline_ripple_overlay() -> int:
+	var f := 0
+
+	var world = _make_world()
+	var overlay := ShorelineRippleOverlay.new()
+
+	# A water cell at the origin with land on its north AND south edges --
+	# unlike GridOutline's shore line, ripples aren't camera-direction
+	# restricted, so BOTH should count as shore edges.
+	var origin_axial := Vector2i(0, 0)
+	var origin_offset := GodotHexOffset.axial_to_offset(origin_axial)
+	world.ground.set_cell(origin_offset, World.TERRAIN_WATER, Vector2i(0, 0))
+	world.ground.set_cell(GodotHexOffset.axial_to_offset(Vector2i(0, -1)), World.TERRAIN_GRASS, Vector2i(0, 0))
+	world.ground.set_cell(GodotHexOffset.axial_to_offset(Vector2i(0, 1)), World.TERRAIN_GRASS, Vector2i(0, 0))
+	var ripple_cells: Array[Vector2i] = [origin_axial]
+	overlay.configure(world.ground, ripple_cells)
+
+	f += _check(overlay._is_shore_edge(origin_axial, origin_offset, 4),
+		"a water cell's north edge IS a ripple shore edge when land borders it there")
+	f += _check(overlay._is_shore_edge(origin_axial, origin_offset, 1),
+		"a water cell's SOUTH edge is ALSO a ripple shore edge when land borders it there -- unlike GridOutline's camera-restricted shore line, ripples aren't direction-limited")
+
+	# North neighbor is water, not land -- no ripple against open water.
+	world.ground.set_cell(GodotHexOffset.axial_to_offset(Vector2i(0, -1)), World.TERRAIN_WATER, Vector2i(0, 0))
+	f += _check(not overlay._is_shore_edge(origin_axial, origin_offset, 4),
+		"a water cell's north edge is NOT a ripple shore edge when the neighbor there is also water")
+
+	# Dash-segment math is reused verbatim from FlowOverlay -- just a direct
+	# sanity check here, the exhaustive cases already live in
+	# _test_flow_overlay_dash_segments.
+	var segs := ShorelineRippleOverlay._dash_segments(20.0, 6.0, 4.0, 0.0)
+	f += _check(segs.size() == 2 and segs[0] == Vector2(0, 6) and segs[1] == Vector2(10, 16),
+		"_dash_segments produces the same known dash pattern as FlowOverlay's")
+
+	# _ripple_state: fully invisible (alpha_mult=0) outside its own active
+	# window -- a real gap, not a dimmed floor; appears right at the edge
+	# (inset_px=0) at the start of its window and washes inward to exactly
+	# max_expand_px by the window's end; alpha rises then falls back to ~0,
+	# never just cut off hard; a different phase01 shifts WHEN a segment's
+	# window lands, so segments desync instead of flashing in lockstep.
+	f += _check(ShorelineRippleOverlay._ripple_state(0.5, 1.0, 0.0, 0.4, 2.0) == Vector2.ZERO,
+		"outside its active window, a ripple is fully invisible (alpha_mult=0), not dimmed")
+	var at_start := ShorelineRippleOverlay._ripple_state(0.0, 1.0, 0.0, 0.4, 2.0)
+	f += _check(at_start.y == 0.0, "a ripple starts right at the true edge -- zero inward drift at the very start of its window")
+	var at_end := ShorelineRippleOverlay._ripple_state(0.399, 1.0, 0.0, 0.4, 2.0)
+	f += _check(at_end.y > 1.9, "a ripple has washed nearly all the way to max_expand_px by the end of its active window")
+	var at_mid := ShorelineRippleOverlay._ripple_state(0.2, 1.0, 0.0, 0.4, 2.0)
+	f += _check(at_mid.x > at_start.x and at_mid.x > 0.9,
+		"alpha rises to near its peak by the middle of the window, not a hard on/off cut")
+	f += _check(absf(ShorelineRippleOverlay._ripple_state(0.0, 1.0, 0.0, 0.4, 2.0).x
+			- ShorelineRippleOverlay._ripple_state(1.0, 1.0, 0.0, 0.4, 2.0).x) < 0.0001,
+		"_ripple_state is periodic -- one full cycle of time returns to the same value")
+	f += _check(ShorelineRippleOverlay._ripple_state(0.0, 1.0, 0.0, 0.4, 2.0)
+			!= ShorelineRippleOverlay._ripple_state(0.0, 1.0, 0.25, 0.4, 2.0),
+		"a different phase01 actually changes the ripple state at the same instant -- segments desync")
+
+	# _cliff_inset_px (2026-10-29 amendment): a ripple must start past
+	# GridOutline's dark cliff line, not underneath it, on the 3 edges that
+	# actually get one -- reading GridOutline's own tuned widths, not a
+	# duplicated guess.
+	f += _check(overlay._cliff_inset_px(4) == 0.0,
+		"with no GridOutline wired, _cliff_inset_px is 0 even on a cliff-edge index -- graceful degradation")
+	var cliff := GridOutline.new()
+	cliff.shore_line_width = 7.0
+	cliff.shore_line_width_diagonal = 3.0
+	overlay._grid_outline = cliff
+	f += _check(overlay._cliff_inset_px(0) == 0.0 and overlay._cliff_inset_px(1) == 0.0 and overlay._cliff_inset_px(2) == 0.0,
+		"the 3 non-cliff edge indices get no inset at all, even with GridOutline wired")
+	f += _check(overlay._cliff_inset_px(4) == cliff.shore_line_width,
+		"the straight-north cliff edge's inset matches GridOutline's actual shore_line_width")
+	f += _check(overlay._cliff_inset_px(3) == cliff.shore_line_width_diagonal and overlay._cliff_inset_px(5) == cliff.shore_line_width_diagonal,
+		"the two diagonal cliff edges' inset matches GridOutline's actual shore_line_width_diagonal, not the straight-north width")
+	cliff.free()
+
+	overlay.free()
+	world.free()
+	return f
+
+## CloudShadowOverlay's actual drifting-shadow look needs a real GPU shader
+## (same "drawn, not tested headlessly" scope as every noise-driven shader in
+## this project) -- but the bounding-box geometry it draws the shader onto is
+## pure and directly testable.
+func _test_cloud_shadow_overlay() -> int:
+	var f := 0
+
+	f += _check(CloudShadowOverlay._bounding_rect(PackedVector2Array(), 10.0) == Rect2(),
+		"an empty position list produces an empty (default) Rect2, not a crash or a garbage rect")
+
+	var positions := PackedVector2Array([Vector2(-50, -20), Vector2(100, 5), Vector2(0, 80)])
+	var margin := 15.0
+	var rect := CloudShadowOverlay._bounding_rect(positions, margin)
+	for p in positions:
+		f += _check(rect.has_point(p), "the bounding rect actually contains every position it was built from")
+	f += _check(is_equal_approx(rect.position.x, -50.0 - margin) and is_equal_approx(rect.position.y, -20.0 - margin),
+		"the rect's top-left corner is the tightest bounding corner, minus the margin -- not padded more than asked")
+	f += _check(is_equal_approx(rect.end.x, 100.0 + margin) and is_equal_approx(rect.end.y, 80.0 + margin),
+		"the rect's bottom-right corner is the tightest bounding corner, plus the margin")
+
+	var world = _make_world()
+	var overlay := CloudShadowOverlay.new()
+	overlay.configure(world.ground, HexMath.cells_in_radius(world.radius))
+	f += _check(overlay._bounds_rect.size.x > 0.0 and overlay._bounds_rect.size.y > 0.0,
+		"configure() on a real map produces a real, non-degenerate bounding rect")
+	# Every actual cell center must land inside the configured bounds -- the
+	# whole point of this overlay is that a cloud shadow can cross any hex on
+	# the map, never a gap at the edge where a cell's own center sits outside
+	# the shape the shader is painted onto.
+	var all_inside := true
+	for axial in HexMath.cells_in_radius(world.radius):
+		var offset := GodotHexOffset.axial_to_offset(axial)
+		var pos: Vector2 = overlay.to_local(world.ground.to_global(world.ground.map_to_local(offset)))
+		if not overlay._bounds_rect.has_point(pos):
+			all_inside = false
+	f += _check(all_inside, "every real map cell's centre lands inside the configured cloud-shadow bounds")
+
+	overlay.free()
+	world.free()
+	return f
+
+## RainController owns only the timing/intensity ramp -- see _intensity_for's
+## doc comment. Pure function, so the whole fade-in/hold/fade-out shape is
+## checked without waiting on a real timer.
+func _test_rain_controller_intensity_curve() -> int:
+	var f := 0
+
+	f += _check(RainController._intensity_for(-0.01, 10.0, 2.0) == 0.0,
+		"before an event starts (negative elapsed), intensity is 0")
+	f += _check(RainController._intensity_for(10.01, 10.0, 2.0) == 0.0,
+		"after an event's own duration has fully elapsed, intensity is 0")
+	f += _check(RainController._intensity_for(0.0, 10.0, 2.0) == 0.0,
+		"intensity is exactly 0 at the very start of an event -- it ramps in, never snaps on")
+	f += _check(RainController._intensity_for(10.0, 10.0, 2.0) == 0.0,
+		"intensity is exactly 0 at the very end of an event -- it ramps out, never snaps off")
+	f += _check(is_equal_approx(RainController._intensity_for(2.0, 10.0, 2.0), 1.0),
+		"intensity reaches exactly 1.0 once fade_s has elapsed from the start")
+	f += _check(is_equal_approx(RainController._intensity_for(8.0, 10.0, 2.0), 1.0),
+		"intensity is still exactly 1.0 right up to fade_s before the end")
+	f += _check(is_equal_approx(RainController._intensity_for(5.0, 10.0, 2.0), 1.0),
+		"intensity holds at 1.0 through the middle of a long-enough event")
+	var rising := RainController._intensity_for(1.0, 10.0, 2.0)
+	f += _check(rising > 0.0 and rising < 1.0, "intensity is partway up during the fade-in window, not a hard step")
+
+	# A short event (duration_s < 2*fade_s): the fade-in and fade-out windows
+	# overlap, so the ramp should degrade into a single triangular pulse that
+	# never actually reaches 1.0, not a sudden full-intensity plateau.
+	var short_mid := RainController._intensity_for(1.0, 2.0, 2.0)
+	f += _check(short_mid > 0.0 and short_mid < 1.0,
+		"a short event (duration < 2*fade_s) never reaches full intensity -- fade-in and fade-out overlap into one triangular pulse")
+
+	f += _check(RainController._intensity_for(5.0, 0.0, 2.0) == 0.0,
+		"a zero-length event (no rain scheduled) always reads as zero intensity")
+	f += _check(RainController._intensity_for(5.0, 10.0, 0.0) == 1.0,
+		"fade_s == 0 means an instant on/off -- full intensity anywhere strictly inside the event")
+
+	# start_rain()/rain_enabled wiring, exercised on a live instance (not just
+	# the pure curve above) -- a disabled controller never reports intensity
+	# even mid-event.
+	var controller := RainController.new()
+	controller.rain_enabled = true
+	controller.start_rain(10.0)
+	controller._timer_s = 5.0
+	controller.fade_s = 2.0
+	f += _check(RainController._intensity_for(controller._timer_s, controller._duration_s, controller.fade_s) == 1.0,
+		"start_rain() with an explicit duration stores that exact duration, not a random one")
+	controller.free()
+
+	return f
+
+## The actual circular-ripple growth/fade math, split out from _draw() --
+## radius grows linearly from 0 to max_radius across the ripple's lifetime;
+## alpha fades from base_alpha down to 0 over the same span.
+func _test_rain_ripple_overlay() -> int:
+	var f := 0
+
+	f += _check(RainRippleOverlay._ripple_radius(0.0, 1.4, 24.0) == 0.0,
+		"a ripple is a point (zero radius) the instant it's born")
+	f += _check(is_equal_approx(RainRippleOverlay._ripple_radius(1.4, 1.4, 24.0), 24.0),
+		"a ripple reaches exactly max_radius at the end of its lifetime")
+	f += _check(is_equal_approx(RainRippleOverlay._ripple_radius(0.7, 1.4, 24.0), 12.0),
+		"radius grows linearly -- halfway through its lifetime, a ripple is at half its max radius")
+	f += _check(RainRippleOverlay._ripple_radius(10.0, 1.4, 24.0) == 24.0,
+		"radius is clamped at max_radius even if asked about an age past the ripple's lifetime")
+	f += _check(RainRippleOverlay._ripple_radius(1.0, 0.0, 24.0) == 0.0,
+		"a zero-length lifetime never produces a radius, rather than dividing by zero")
+
+	f += _check(is_equal_approx(RainRippleOverlay._ripple_alpha(0.0, 1.4, 0.5), 0.5),
+		"a ripple is born at full (base) alpha")
+	f += _check(is_equal_approx(RainRippleOverlay._ripple_alpha(1.4, 1.4, 0.5), 0.0),
+		"a ripple has faded to exactly 0 alpha at the end of its lifetime")
+	f += _check(is_equal_approx(RainRippleOverlay._ripple_alpha(0.7, 1.4, 0.5), 0.25),
+		"alpha fades linearly -- halfway through its lifetime, a ripple is at half its base alpha")
+	f += _check(RainRippleOverlay._ripple_alpha(10.0, 1.4, 0.5) == 0.0,
+		"alpha is clamped to 0 (never negative) past the ripple's lifetime")
+
+	# configure() on a real map's water cells -- same "every cell center lands
+	# inside what was configured" shape of check as _test_cloud_shadow_overlay,
+	# just against a position list instead of a bounding rect.
+	var world = _make_world()
+	var overlay := RainRippleOverlay.new()
+	var water_cells: Array[Vector2i] = []
+	water_cells.assign(world._river_cells.keys())
+	overlay.configure(world.ground, water_cells, null)
+	f += _check(overlay._water_cell_positions.size() == water_cells.size(),
+		"configure() records exactly one position per configured water cell")
+
+	# _process spawns ripples when a rain controller reports intensity > 0,
+	# and spawns none when it reports 0 -- exercised directly rather than via
+	# a real frame loop, since _process is just a thin driver over this.
+	var fake_controller := RainController.new()
+	fake_controller.rain_enabled = false # intensity always reads 0 -- see RainController._process
+	overlay._rain_controller = fake_controller
+	overlay._process(1.0)
+	f += _check(overlay._ripples.is_empty(), "no ripples spawn while the wired RainController reports zero intensity")
+
+	fake_controller.rain_enabled = true
+	fake_controller.intensity = 1.0 # bypass the controller's own _process entirely -- this overlay only ever reads the property
+	overlay._process(1.0)
+	f += _check(not overlay._ripples.is_empty(), "ripples spawn once the wired RainController reports nonzero intensity")
+
+	fake_controller.free()
+	overlay.free()
+	world.free()
+	return f
+
+## World._apply_rain_effects pushes rain intensity into Ground's modulate and
+## into every tree's sway ShaderMaterial -- the live-wiring itself, not the
+## ramp math (already covered above) or the shader visuals (screenshot-only,
+## same as every other noise/shader effect in this project).
+func _test_world_rain_effects() -> int:
+	var f := 0
+
+	f += _check(World._boosted_for_rain(5.0, 2.0, 0.0) == 5.0,
+		"at zero rain intensity, the boosted value is just the base value, unboosted")
+	f += _check(is_equal_approx(World._boosted_for_rain(5.0, 2.0, 1.0), 10.0),
+		"at full rain intensity, the boosted value is base * boost_multiplier")
+	f += _check(is_equal_approx(World._boosted_for_rain(5.0, 2.0, 0.5), 7.5),
+		"the boost interpolates linearly between the base and fully-boosted value")
+	f += _check(World._boosted_for_rain(5.0, 2.0, -1.0) == 5.0 and World._boosted_for_rain(5.0, 2.0, 2.0) == 10.0,
+		"an out-of-range intensity is clamped to [0, 1] before boosting, never over- or under-shooting")
+
+	var world = _make_world()
+	world.rain_controller = RainController.new()
+	world.rain_controller.rain_enabled = true
+	world.rain_controller.intensity = 1.0
+	f += _check(world._tree_sway_materials.size() > 0,
+		"a real map with trees actually populated _tree_sway_materials during _build_features")
+	world._apply_rain_effects()
+	var boosted_amount: float = World._boosted_for_rain(world.tree_sway_amount_px, world.rain_tree_sway_amount_boost, 1.0)
+	var any_boosted := false
+	for mat in world._tree_sway_materials:
+		if is_equal_approx(mat.get_shader_parameter("sway_amount_px"), boosted_amount):
+			any_boosted = true
+	f += _check(any_boosted, "at full rain intensity, every tree's sway material actually receives the boosted sway_amount_px")
+	f += _check(not world.ground.modulate.is_equal_approx(Color.WHITE),
+		"at full rain intensity, Ground's modulate has actually shifted away from dry/white toward wet_ground_tint")
+
+	world.rain_controller.free()
 	world.free()
 	return f
 
@@ -1473,6 +1935,124 @@ func _test_flow_overlay_vector() -> int:
 
 	overlay.free()
 	world.free()
+	return f
+
+## Animated flow arrows (2026-10-27, user ask: "animated flow arrows" per
+## brief SS6). The dash pattern's scrolling is pure segment math
+## (_dash_segments), split out specifically so it's testable without a live
+## draw context -- same reasoning as _flow_vector above.
+func _test_flow_overlay_dash_segments() -> int:
+	var f := 0
+
+	var empty := FlowOverlay._dash_segments(0.0, 6.0, 4.0, 0.0)
+	f += _check(empty.is_empty(), "zero-length shaft (an arrow too short to draw) produces no dash segments")
+
+	var segs0: Array[Vector2] = FlowOverlay._dash_segments(20.0, 6.0, 4.0, 0.0)
+	f += _check(segs0 == ([Vector2(0.0, 6.0), Vector2(10.0, 16.0)] as Array[Vector2]),
+		"phase=0 on a 20px shaft (dash 6, gap 4) places dashes at [0,6] and [10,16]")
+
+	for seg in FlowOverlay._dash_segments(20.0, 6.0, 4.0, 37.0):
+		f += _check(seg.x >= 0.0 and seg.y <= 20.0,
+			"every returned segment is clipped inside [0, total_len], however large phase gets")
+
+	# Scrolling direction: the dash nearest the origin should move toward the
+	# tip (larger t) as phase increases -- the opposite would mean flow
+	# visually runs backward, exactly the kind of sign-flip bug _flow_vector's
+	# own test above guards against for the vector itself.
+	var early: Array[Vector2] = FlowOverlay._dash_segments(20.0, 6.0, 4.0, 1.0)
+	var later: Array[Vector2] = FlowOverlay._dash_segments(20.0, 6.0, 4.0, 4.0)
+	f += _check(later[0].x > early[0].x,
+		"as phase increases, a dash's position shifts toward the arrowhead (larger t), not back toward the cell center")
+
+	# Full period is a no-op (the pattern repeats exactly) -- confirms the
+	# modulo wrap doesn't drift.
+	var period := 10.0
+	f += _check(FlowOverlay._dash_segments(20.0, 6.0, 4.0, 3.0) == FlowOverlay._dash_segments(20.0, 6.0, 4.0, 3.0 + period),
+		"the dash pattern repeats exactly every (dash_length + gap_length) of phase")
+
+	return f
+
+## WaterShimmerOverlay (2026-10-27, user ask: "water shimmer next please").
+## Same "drawn, not tested headlessly" scope as every other _draw()-based
+## overlay in this project (GridOutline's shore edges, FlowOverlay's arrow
+## geometry) -- the moving glint itself lives in a GPU fragment shader with
+## nothing to unit-test headlessly, but the two things that ARE pure,
+## testable logic (which cells get a shimmer polygon at all, and whether
+## that polygon's geometry actually lines up with the real tile edges) are
+## checked directly.
+func _test_water_shimmer_overlay() -> int:
+	var f := 0
+	var world = _make_world()
+	var overlay := WaterShimmerOverlay.new()
+
+	var water_cells: Array[Vector2i] = []
+	water_cells.assign(world._river_cells.keys())
+	overlay.configure(world.ground, water_cells)
+
+	f += _check(water_cells.size() > 0,
+		"minimal_test_mode=false generates at least one river/water cell to shimmer")
+	f += _check(overlay._cells.size() == water_cells.size(),
+		"configure() stores exactly the water cells it was given -- not every cell on the map")
+	for axial in overlay._cells:
+		f += _check(world._terrain_for(axial) == World.TERRAIN_WATER,
+			"every cell WaterShimmerOverlay was configured with is an actual water cell (ground truth: World._terrain_for)")
+
+	# Geometry must align exactly with GridOutline's hex edges -- both derive
+	# the same hex from World.TILE_SIZE independently; a drift between them
+	# would mean the shimmer polygon doesn't match the tile it's drawn over.
+	var shimmer_outline := overlay._outline_points()
+	var grid_outline_ref := GridOutline.new()
+	var grid_points := grid_outline_ref._outline_points()
+	f += _check(shimmer_outline.size() == 6 and shimmer_outline.size() == grid_points.size(),
+		"the shimmer hex outline has the same 6 corners as GridOutline's")
+	var all_match := true
+	for i in range(shimmer_outline.size()):
+		if not shimmer_outline[i].is_equal_approx(grid_points[i]):
+			all_match = false
+	f += _check(all_match,
+		"the shimmer polygon's corners exactly match GridOutline's -- same tile, same geometry, independently derived but never allowed to drift apart")
+
+	grid_outline_ref.free()
+	overlay.free()
+	world.free()
+	return f
+
+## MoodLighting's actual on-screen tinting needs a real CanvasModulate/
+## Viewport to drive (same "drawn, not tested headlessly" reasoning as every
+## other mood overlay in this project) -- but the day/dusk/night cycle math
+## itself is pure and split out specifically so it's checkable headlessly.
+func _test_mood_lighting() -> int:
+	var f := 0
+	var day := Color(1.0, 1.0, 1.0, 1.0)
+	var dusk := Color(1.0, 0.68, 0.48, 1.0)
+	var night := Color(0.4, 0.45, 0.65, 1.0)
+
+	f += _check(MoodLighting._phase_color(0.0, day, dusk, night).is_equal_approx(day),
+		"phase 0.0 is exactly the day color")
+	f += _check(MoodLighting._phase_color(0.25, day, dusk, night).is_equal_approx(dusk),
+		"phase 0.25 (sunset) is exactly the dusk color")
+	f += _check(MoodLighting._phase_color(0.5, day, dusk, night).is_equal_approx(night),
+		"phase 0.5 is exactly the night color")
+	f += _check(MoodLighting._phase_color(0.75, day, dusk, night).is_equal_approx(dusk),
+		"phase 0.75 (sunrise) is exactly the dusk color again")
+	f += _check(MoodLighting._phase_color(1.0, day, dusk, night).is_equal_approx(day),
+		"phase wraps -- 1.0 is the same as 0.0, so the loop has no seam")
+	f += _check(MoodLighting._phase_color(0.125, day, dusk, night).is_equal_approx(day.lerp(dusk, 0.5)),
+		"the midpoint between two stops is a straight lerp between them")
+
+	f += _check(MoodLighting._cycle_color(37.0, 90.0, day, dusk, night, 0.0).is_equal_approx(Color.WHITE),
+		"strength=0.0 means no tint at all, regardless of time or duration")
+	f += _check(MoodLighting._cycle_color(45.0, 90.0, day, dusk, night, 1.0).is_equal_approx(night),
+		"strength=1.0 at the half-duration mark is the exact, undiluted night color")
+	f += _check(MoodLighting._cycle_color(22.5, 90.0, day, dusk, night, 0.5).is_equal_approx(Color.WHITE.lerp(dusk, 0.5)),
+		"strength blends the cycle color toward white -- 0.5 strength at dusk is halfway between white and dusk")
+
+	# Scaling cycle_duration_sec must scale the period, not just shift it --
+	# the same fraction of a longer day should land on the same palette color.
+	f += _check(MoodLighting._cycle_color(10.0, 40.0, day, dusk, night, 1.0).is_equal_approx(
+			MoodLighting._cycle_color(20.0, 80.0, day, dusk, night, 1.0)),
+		"the same fraction of two different cycle durations lands on the same color")
+
 	return f
 
 ## PlumeOverlay's actual fill rendering needs a real Viewport to drive (same
