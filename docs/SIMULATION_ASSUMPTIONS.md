@@ -101,10 +101,65 @@ into a running `GridModel` -- see `DECISIONS.md`'s entries on live-tuning.
   (the actual win/loss limit) are deliberately SEPARATE numbers, even though they share a default (0.03 kg/m3) --
   see `World`'s own doc comments.
 
+## Mechanical dispersion (Gate C, complete)
+
+- **Governing equations** (brief SS12.2/SS12.3): `D_L = alpha_L * |v| + D_m_effective`, `D_T = alpha_T * |v| +
+  D_m_effective`, projected onto each face's own normal via the standard 2D dispersion-tensor formula
+  `D_normal = D_T + (D_L - D_T) * cos(theta)^2`, where `theta` is the angle between the local flow direction and
+  the face normal. Implemented as a term ADDED to (not merged with) molecular diffusion's own conductance --
+  `D_m_effective` is already covered by `_face_diffusion_conductance_m3_s`, so `_face_dispersion_conductance_m3_s`
+  carries only the `alpha_L * |v|` / `alpha_T * |v|` part; the two sums are physically equivalent to the brief's
+  combined formula and correctly collapse to diffusion-only at `v = 0`.
+- **Local flow direction**: reconstructed per cell from all six face fluxes
+  (`GridModel._cell_velocity_vector_m_s`) -- exact for a locally uniform flow field, since a flat-top hex's 6
+  neighbor directions are always evenly spaced 60 degrees apart (`sum(n_hat (x) n_hat) = 3*I` for 6 such
+  directions in 2D). A face's representative velocity is the AVERAGE of its two cells' vectors.
+- **`dispersivity_longitudinal_m` / `dispersivity_transverse_m`** (defaults 10.0 m / 1.0 m, a 10:1 ratio -- the
+  commonly cited rule of thumb for a conservative tracer, e.g. Gelhar et al.): deliberately a SINGLE
+  scenario-wide pair, not a per-geology table like K/porosity/diffusion -- real dispersivity is primarily
+  scale-dependent (how far/heterogeneously the plume has traveled), not a clean function of lithology, per the
+  brief's own caveat ("Dispersivity is scale dependent"). Inspector-tunable on `World`, live-refreshed via
+  `GridModel.set_dispersivity()` (no head re-solve needed -- dispersivity never affects the flow field).
+- **Scope**: same as molecular diffusion -- interior cell-to-cell faces only; the open south boundary and the
+  capture well do not yet disperse (or diffuse), same deferred-boundary-concentration reasoning.
+
+## Equilibrium sorption / retardation (Gate D, first half, complete)
+
+- **Governing equation** (brief SS12.2/SS12.3): linear equilibrium sorption, `S = Kd * C` (S: mass sorbed per
+  mass of dry solid [kg/kg], C: aqueous concentration [kg/m3 water]), giving the retardation factor
+  `R_f = 1 + rho_b * Kd / n_e`.
+- **Implementation choice** (brief SS12.3 explicitly offers two options; this uses the first): "represent total
+  equilibrium inventory with retardation" rather than explicitly tracking separate dissolved/sorbed pools.
+  `mass_kg` per cell already means the TOTAL inventory (dissolved + sorbed); `get_concentration_kg_m3` now
+  returns `mass_kg / (R_f * pore_volume)` -- the AQUEOUS concentration -- instead of plain `mass_kg /
+  pore_volume`. Every transport term (advective, diffusive, dispersive, well capture, south-boundary escape)
+  already multiplies by this same function, so retardation falls out of all of them for free with no other
+  code path changed; the derivation `M_total = R_f * C * V_pore` is spelled out in
+  `GridModel.retardation_factor`'s own doc comment. `get_dissolved_mass_kg`/`get_sorbed_mass_kg` are cheap
+  derived getters (not separately stored state) for future UI (brief SS12.5: "inspect... sorbed inventory").
+- **Bulk density**: derived from each cell's own porosity, `rho_b = rho_particle * (1 - n_e)`, rather than a
+  second independent per-geology table -- `PARTICLE_DENSITY_KG_M3 = 2650.0` kg/m3 (a single, geology-INDEPENDENT
+  constant: the standard average mineral grain density for common quartz/silicate sediments; porosity, not
+  grain density, is what actually differs between sand/silt/clay).
+- **`kd_m3_kg` defaults** (m3/kg): sand `2.0e-4`, silt `8.0e-4`, clay `3.0e-3` -- a per-geology table (like
+  K/porosity/diffusion, unlike dispersivity), since Kd genuinely depends on sediment type (brief SS12.2's own
+  caveat: "Kd depends on species and sediment"). Species is still fixed/implicit (single-contaminant MVP).
+  Resulting retardation factors with the default porosity table: sand ~2.2x, silt ~7.4x, clay ~59x -- clay's
+  large value is consistent with this project's existing deliberately-extreme clay characterization (6000x K
+  contrast), not a separate exaggeration invented for sorption. All three Inspector-tunable on `World`
+  (`sand_kd_m3_kg`/`silt_kd_m3_kg`/`clay_kd_m3_kg`), live-refreshed via the same `apply_geology_parameters`
+  hot-swap path as K/porosity/diffusion.
+- **CFL stability bound**: retardation only ever RELAXES `max_stable_dt_s()` (a retarded cell's total inventory
+  drains slower, so a larger step stays stable) -- implemented as a single multiply by `R_f` at the point
+  `max_stable_dt_s` divides pore volume by total outflow, rather than threading `R_f` through every outflow
+  term individually.
+- **Scope**: equilibrium sorption only. Kinetic (rate-limited) sorption/desorption -- the brief's "important for
+  tailing and rebound" row, which DOES need a genuine separate dissolved/sorbed pool, since equilibrium can no
+  longer be assumed instantaneous -- and biodegradation/reactions (Gate D's other half) remain unimplemented.
+
 ## Not yet implemented (tracked against brief SS12.2/SS12.6, do not assume otherwise)
 
-Mechanical dispersion (the velocity-dependent longitudinal/transverse term -- molecular diffusion, above, is now
-implemented; dispersion is still a separate, later addition), equilibrium/kinetic sorption, biodegradation/
-reactions, source dissolution, volatilisation, matrix diffusion, geochemical speciation, density-dependent/
-multiphase flow, transient (storage-based) flow, recharge, and multiple vertical layers are all explicitly out of
-scope until their respective gates (C/D/E/F). `World`'s "boost flow"-style mechanics do not exist in this build.
+Kinetic sorption/desorption, biodegradation/reactions, source dissolution, volatilisation, matrix diffusion,
+geochemical speciation, density-dependent/multiphase flow, transient (storage-based) flow, recharge, and
+multiple vertical layers are all explicitly out of scope until their respective gates (D/E/F). `World`'s
+"boost flow"-style mechanics do not exist in this build.

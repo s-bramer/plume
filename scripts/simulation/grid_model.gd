@@ -85,6 +85,34 @@ const DEFAULT_GEOLOGY_DIFFUSION_M2_S := {
 	Geology.CLAY: 4.0e-10,
 }
 
+## Brief SS12.2/SS12.3/SS12.6 Gate D: linear equilibrium sorption distribution
+## coefficient, `Kd` [m3/kg] -- "depends on species and sediment" (brief
+## SS12.2's own caveat). Species is still fixed/implicit (this MVP is still
+## single-contaminant), so, same as K/porosity/diffusion above, Kd is a
+## per-geology lookup: a clay/fine-grained unit's higher surface area and clay
+## mineral content genuinely does sorb a typical organic solute more strongly
+## than sand, independent of anything this project invented -- real physics,
+## not a difficulty-tuning knob. Defaults chosen so clay's resulting
+## retardation factor (see retardation_factor, derived below) is large enough
+## to visibly matter without being a second, redundant "nothing ever moves"
+## story on top of clay's existing 6000x K contrast.
+const DEFAULT_GEOLOGY_KD_M3_KG := {
+	Geology.SAND: 2.0e-4,
+	Geology.SILT: 8.0e-4,
+	Geology.CLAY: 3.0e-3,
+}
+
+## Average mineral grain (particle) density, used only to derive each cell's
+## BULK density from its already-established porosity (rho_b = rho_particle *
+## (1 - n_e), the standard relation) rather than inventing a second,
+## independent per-geology bulk-density table that could silently drift out
+## of sync with porosity. ~2650 kg/m3 is the standard textbook value for
+## common quartz/silicate sediments and is deliberately NOT varied by
+## geology: unlike porosity (which depends heavily on grain packing/sorting,
+## the real reason sand/silt/clay differ), the mineral grains THEMSELVES are
+## similar densities across these three placeholder units.
+const PARTICLE_DENSITY_KG_M3 := 2650.0
+
 ## Regional head gradient used ONLY to define this model's two boundary
 ## conditions (brief SS12.6 Gate A: "conservative heterogeneous-K head
 ## solver" -- the prior MVP imposed this formula at EVERY cell, which the
@@ -150,14 +178,30 @@ var geology_id: Dictionary = {} # Vector2i (q, r) -> Geology enum value
 var k_m_s: Dictionary = {} # Vector2i (q, r) -> float, hydraulic conductivity
 var porosity: Dictionary = {} # Vector2i (q, r) -> float, effective porosity
 var diffusion_m2_s: Dictionary = {} # Vector2i (q, r) -> float, effective molecular diffusion coefficient (brief SS12.2/SS12.3's D_m_effective)
+var kd_m3_kg: Dictionary = {} # Vector2i (q, r) -> float, linear equilibrium sorption distribution coefficient (brief SS12.2/SS12.6 Gate D)
+## Vector2i (q, r) -> float. Derivation of R_f = 1 + rho_b*Kd/n_e (brief
+## SS12.3) from linear equilibrium sorption, S = Kd*C (S: mass sorbed per
+## mass of dry solid [kg/kg], C: aqueous concentration [kg/m3 water]):
+##   M_total = M_aqueous + M_sorbed = C*V_water + S*rho_b*V_total
+##           = C*V_water + Kd*C*rho_b*V_total
+##           = C*V_water * (1 + Kd*rho_b*V_total/V_water)
+## and V_total/V_water = 1/n_e (V_water = n_e*V_total by definition), so:
+##   M_total = C*V_water * (1 + rho_b*Kd/n_e) = C * V_pore * R_f
+## i.e. M_total = R_f * C * V_pore -- see get_concentration_kg_m3's doc
+## comment for why dividing BY R_f there is this project's entire
+## implementation of Gate D (brief SS12.3's "represent total equilibrium
+## inventory with retardation" option, not the separate-dissolved/sorbed-pools
+## one, which is kinetic sorption's job if that's ever built).
+var retardation_factor: Dictionary = {}
 var head_m: Dictionary = {} # Vector2i (q, r) -> float, hydraulic head -- SOLVED by _solve_heads(), not an imposed formula (see BASE_HEAD_M's doc comment)
 var last_head_solve: Dictionary = {} # diagnostics from the most recent _solve_heads() call: {heads, iterations, max_residual_m, converged} -- surfaced for tests/UI, not required for the physics itself
-var mass_kg: Dictionary = {} # Vector2i (q, r) -> float, contaminant mass (single species, MVP)
+var mass_kg: Dictionary = {} # Vector2i (q, r) -> float, TOTAL contaminant mass (dissolved + sorbed, single species, MVP) -- see get_concentration_kg_m3's doc comment for how Gate D's retardation splits this into aqueous/sorbed shares without a second dictionary
 var escaped_mass_kg: float = 0.0 # contaminant that has left the modeled domain through the open downstream boundary -- tracked, not discarded, so total mass stays auditable (mass_kg's sum + escaped_mass_kg should always equal everything ever seeded)
 var captured_mass_kg: float = 0.0 # contaminant removed by the capture well (see set_well/step_transport) -- tracked the same way as escaped_mass_kg, not silently discarded
 var geology_k_m_s: Dictionary # Geology enum value -> float, the table actually in use (defaults merged with any overrides)
 var geology_porosity: Dictionary # Geology enum value -> float, ditto
 var geology_diffusion_m2_s: Dictionary # Geology enum value -> float, ditto
+var geology_kd_m3_kg: Dictionary # Geology enum value -> float, ditto
 
 ## Brief SS8 Phase 1 step 7 / SS12.4 test 9 ("pumping changes flow field and
 ## removes dissolved mass by extracted-water concentration"). Modeled as a
@@ -181,18 +225,69 @@ var geology_diffusion_m2_s: Dictionary # Geology enum value -> float, ditto
 var well_axial: Vector2i = Vector2i(0, 0)
 var well_pumping_rate_m3_s: float = 0.0 # 0.0 means "no well" -- World pushes its own Inspector-tunable well_axial/well_pumping_rate_m3_s in via set_well, same live-tuning pattern as apply_geology_parameters
 
-## k_overrides/porosity_overrides/diffusion_overrides replace individual
-## entries of DEFAULT_GEOLOGY_K_M_S/DEFAULT_GEOLOGY_POROSITY/
-## DEFAULT_GEOLOGY_DIFFUSION_M2_S (keyed by the Geology enum) -- any geology
-## not mentioned keeps its default. Every existing caller passes none of
-## these and gets exactly the old hardcoded behavior.
-func _init(p_radius: int, k_overrides: Dictionary = {}, porosity_overrides: Dictionary = {}, diffusion_overrides: Dictionary = {}) -> void:
+## Brief SS12.2/SS12.3/SS12.6 Gate C's second half: mechanical dispersion --
+## the velocity-dependent, longitudinal/transverse spreading that molecular
+## diffusion (above) deliberately left out. Unlike K/porosity/diffusion_m2_s,
+## dispersivity is NOT treated as a per-geology lookup here: real dispersivity
+## is primarily SCALE-dependent (how far/heterogeneously the plume has
+## traveled), not a clean function of lithology the way K is, and the brief's
+## own caveat says so directly ("Dispersivity is scale dependent"). A single
+## scenario-wide pair of values is the honest simplification for this MVP --
+## see World's dispersivity_longitudinal_m/dispersivity_transverse_m exports
+## for the Inspector-tunable live-swap (set_dispersivity(), below).
+##
+## Default ratio (10:1, longitudinal:transverse) is the commonly cited rule of
+## thumb (e.g. Gelhar et al.) for a conservative tracer; the absolute
+## magnitude (10 m longitudinal) is deliberately a small fraction of
+## CELL_SPACING_M (100 m) -- large enough to visibly broaden/elongate the
+## plume without swamping advection, which is still the dominant transport
+## process at this grid's velocities.
+const DEFAULT_DISPERSIVITY_LONGITUDINAL_M := 10.0
+const DEFAULT_DISPERSIVITY_TRANSVERSE_M := 1.0
+var dispersivity_longitudinal_m: float = DEFAULT_DISPERSIVITY_LONGITUDINAL_M
+var dispersivity_transverse_m: float = DEFAULT_DISPERSIVITY_TRANSVERSE_M
+
+## Unit direction (Cartesian) of each of HexMath's 6 neighbor offsets, built
+## once in _init() rather than per-call: _cell_velocity_vector_m_s() and
+## _face_dispersion_conductance_m3_s() below both need these every substep,
+## and they never change once the grid exists (they depend only on the hex
+## grid's geometry, not on anything about THIS scenario). Deliberately reuses
+## HexMath.axial_to_pixel's own flat-top geometry (via preload above, already
+## used for cells_in_radius/neighbors) rather than re-deriving the same
+## angles independently in this file, so the two can never silently drift
+## apart if the hex orientation convention is ever revisited again (it
+## already has been once, per that file's own header comment). The "size"
+## argument (1.0) is irrelevant beyond normalization -- only the DIRECTION
+## is used, never a physical length from it; CELL_SPACING_M is this file's
+## own, separate source of truth for actual distance.
+var _direction_unit_vectors: Dictionary = {} # Vector2i (one of HexMath.NEIGHBOR_OFFSETS) -> Vector2 unit direction
+
+## k_overrides/porosity_overrides/diffusion_overrides/kd_overrides replace
+## individual entries of DEFAULT_GEOLOGY_K_M_S/DEFAULT_GEOLOGY_POROSITY/
+## DEFAULT_GEOLOGY_DIFFUSION_M2_S/DEFAULT_GEOLOGY_KD_M3_KG (keyed by the
+## Geology enum) -- any geology not mentioned keeps its default. Every
+## existing caller passes none of these and gets exactly the old hardcoded
+## behavior.
+func _init(p_radius: int, k_overrides: Dictionary = {}, porosity_overrides: Dictionary = {}, diffusion_overrides: Dictionary = {}, kd_overrides: Dictionary = {}) -> void:
 	radius = p_radius
 	for axial in HexMath.cells_in_radius(radius):
 		top_elevation_m[axial] = _elevation_at(axial)
 		geology_id[axial] = _geology_at(axial)
 		mass_kg[axial] = 0.0
-	apply_geology_parameters(k_overrides, porosity_overrides, diffusion_overrides) # also solves the initial head field, see that function
+	for offset: Vector2i in HexMath.NEIGHBOR_OFFSETS:
+		_direction_unit_vectors[offset] = HexMath.axial_to_pixel(offset, 1.0).normalized()
+	apply_geology_parameters(k_overrides, porosity_overrides, diffusion_overrides, kd_overrides) # also solves the initial head field, see that function
+
+## Live "hot swap" for the mechanical-dispersion parameters, same spirit as
+## set_well/apply_geology_parameters -- called from World's own
+## dispersivity_longitudinal_m/dispersivity_transverse_m exports' setters, so
+## an Inspector edit made while playing takes effect on the very next
+## transport step. Unlike set_well/apply_geology_parameters, this does NOT
+## need to re-solve heads: dispersivity has no effect on the flow/head field
+## at all, only on how transport spreads mass once the flow field exists.
+func set_dispersivity(longitudinal_m: float, transverse_m: float) -> void:
+	dispersivity_longitudinal_m = longitudinal_m
+	dispersivity_transverse_m = transverse_m
 
 ## Re-derives k_m_s/porosity/diffusion_m2_s for every cell from its EXISTING
 ## geology_id (left untouched) and the given override tables -- a cheap "hot
@@ -204,19 +299,33 @@ func _init(p_radius: int, k_overrides: Dictionary = {}, porosity_overrides: Dict
 ## if I choose the highest possible K for clay... I am getting similar
 ## behaviour", because nothing had ever re-applied the change -- see
 ## World._refresh_geology_parameters, which calls this on every edit).
-func apply_geology_parameters(k_overrides: Dictionary, porosity_overrides: Dictionary, diffusion_overrides: Dictionary = {}) -> void:
+func apply_geology_parameters(k_overrides: Dictionary, porosity_overrides: Dictionary, diffusion_overrides: Dictionary = {}, kd_overrides: Dictionary = {}) -> void:
 	geology_k_m_s = DEFAULT_GEOLOGY_K_M_S.duplicate()
 	geology_k_m_s.merge(k_overrides, true)
 	geology_porosity = DEFAULT_GEOLOGY_POROSITY.duplicate()
 	geology_porosity.merge(porosity_overrides, true)
 	geology_diffusion_m2_s = DEFAULT_GEOLOGY_DIFFUSION_M2_S.duplicate()
 	geology_diffusion_m2_s.merge(diffusion_overrides, true)
+	geology_kd_m3_kg = DEFAULT_GEOLOGY_KD_M3_KG.duplicate()
+	geology_kd_m3_kg.merge(kd_overrides, true)
 	for axial: Vector2i in geology_id.keys():
 		var geo: int = geology_id[axial]
 		k_m_s[axial] = geology_k_m_s[geo]
 		porosity[axial] = geology_porosity[geo]
 		diffusion_m2_s[axial] = geology_diffusion_m2_s[geo]
-	_solve_heads() # K changed -> every face conductance changed -> the steady-state head field must be re-solved, not just the K/porosity/diffusion tables
+		kd_m3_kg[axial] = geology_kd_m3_kg[geo]
+		# R_f = 1 + rho_b*Kd/n_e (brief SS12.2/SS12.3's retardation formula),
+		# rho_b derived from THIS cell's own porosity (see
+		# PARTICLE_DENSITY_KG_M3's doc comment) rather than a separate table --
+		# recomputed here, not cached as its own export, so it always reflects
+		# the porosity/Kd values actually in effect right now.
+		var n_e: float = porosity[axial]
+		if n_e > 0.0:
+			var bulk_density_kg_m3: float = PARTICLE_DENSITY_KG_M3 * (1.0 - n_e)
+			retardation_factor[axial] = 1.0 + bulk_density_kg_m3 * kd_m3_kg[axial] / n_e
+		else:
+			retardation_factor[axial] = 1.0 # no pore space to sort dissolved/sorbed between; get_concentration_kg_m3 already returns 0 for this cell regardless
+	_solve_heads() # K changed -> every face conductance changed -> the steady-state head field must be re-solved, not just the K/porosity/diffusion/Kd tables
 
 func get_elevation(axial: Vector2i) -> float:
 	return top_elevation_m.get(axial, 0.0)
@@ -232,6 +341,20 @@ func get_porosity(axial: Vector2i) -> float:
 
 func get_diffusion_m2_s(axial: Vector2i) -> float:
 	return diffusion_m2_s.get(axial, 0.0)
+
+func get_kd_m3_kg(axial: Vector2i) -> float:
+	return kd_m3_kg.get(axial, 0.0)
+
+## Bulk (dry) density -- derived from porosity, not a stored table; see
+## PARTICLE_DENSITY_KG_M3's doc comment.
+func get_bulk_density_kg_m3(axial: Vector2i) -> float:
+	return PARTICLE_DENSITY_KG_M3 * (1.0 - get_porosity(axial))
+
+## R_f = 1 + rho_b*Kd/n_e (brief SS12.2/SS12.3/SS12.6 Gate D). 1.0 (no
+## retardation) for a cell apply_geology_parameters hasn't priced yet,
+## matching every other get_*/default convention in this file.
+func get_retardation_factor(axial: Vector2i) -> float:
+	return retardation_factor.get(axial, 1.0)
 
 func get_head(axial: Vector2i) -> float:
 	return head_m.get(axial, 0.0)
@@ -437,6 +560,90 @@ func _face_diffusion_conductance_m3_s(axial_a: Vector2i, axial_b: Vector2i) -> f
 	var n_e := (get_porosity(axial_a) + get_porosity(axial_b)) / 2.0
 	return n_e * FACE_AREA_M2 * d_h / CELL_SPACING_M
 
+## Pore-water velocity VECTOR (brief SS4's v = q/n_e, generalized from one
+## face's scalar magnitude to a full 2D vector), reconstructed from all six
+## of a cell's face fluxes -- needed so mechanical dispersion (below) knows
+## the LOCAL FLOW DIRECTION, not just one face's own flow rate (brief
+## SS12.3: "Use a tensor and face-normal projection for general flow
+## directions").
+##
+## Reconstruction: sum each face's signed Darcy flux times that face's own
+## unit direction, then divide by 3. This is EXACT for a locally uniform
+## flow field: a flat-top hex's 6 neighbor directions are always evenly
+## spaced 60 degrees apart, and for N evenly spaced unit vectors in 2D,
+## sum(n_hat (x) n_hat) = (N/2)*I -- here N=6, so dividing by 3 recovers the
+## true flux vector exactly whenever all six faces are consistent with one
+## uniform vector, and is a reasonable (least-squares-style) estimate
+## otherwise. A missing neighbor (map edge) contributes nothing, which is
+## exactly the same no-flow-by-omission convention _solve_heads() already
+## uses for a missing-neighbor face -- not a new approximation invented for
+## this function.
+func _cell_velocity_vector_m_s(axial: Vector2i) -> Vector2:
+	var flux_vec := Vector2.ZERO
+	for offset: Vector2i in HexMath.NEIGHBOR_OFFSETS:
+		var neighbor: Vector2i = axial + offset
+		if not top_elevation_m.has(neighbor):
+			continue
+		flux_vec += face_flux_m_s(axial, neighbor) * _direction_unit_vectors[offset]
+	var n_e := get_porosity(axial)
+	if n_e <= 0.0:
+		return Vector2.ZERO
+	return (flux_vec / 3.0) / n_e
+
+## Every cell's velocity vector, computed once per step_transport()/
+## max_stable_dt_s() call rather than redundantly inside the per-face loop
+## (each cell would otherwise be recomputed up to 4 times per call: once as
+## the upstream side of its own 3 transport-edge faces, up to 3 more times
+## as a neighbor of an adjacent cell's).
+func _all_cell_velocity_vectors_m_s() -> Dictionary:
+	var result: Dictionary = {}
+	for axial: Vector2i in top_elevation_m.keys():
+		result[axial] = _cell_velocity_vector_m_s(axial)
+	return result
+
+## Brief SS12.2/SS12.3/SS12.6 Gate C's mechanical-dispersion term -- velocity-
+## dependent spreading, ADDED on top of (not replacing) molecular diffusion
+## above. D_L = alpha_L * |v| (longitudinal, along the local flow direction)
+## and D_T = alpha_T * |v| (transverse, perpendicular to it) are projected
+## onto THIS face's own normal direction via the standard 2D dispersion-
+## tensor projection:
+##   D_normal = D_T + (D_L - D_T) * cos(theta)^2
+## where theta is the angle between the local flow direction and the face
+## normal (brief SS12.3: "Use a tensor and face-normal projection for general
+## flow directions"). |v| and the flow direction come from the AVERAGE of
+## the two cells' velocity vectors sharing this face -- a representative
+## LOCAL flow vector for the face, not just this one face's own flux: real
+## dispersion is a property of the bulk flow carrying a parcel of water past
+## this face, not of one face's flow rate in isolation.
+##
+## Returns the same CONDUCTANCE shape _face_diffusion_conductance_m3_s does
+## (this IS the same Fickian form -- dispersion spreads down the
+## concentration gradient exactly like diffusion does, just with a velocity-
+## dependent coefficient instead of a fixed one), so step_transport()/
+## max_stable_dt_s() add this straight onto the SAME diffusive accumulator
+## diffusion already contributes to, rather than needing a parallel code
+## path. Zero when the local flow is stagnant (D_L and D_T both collapse to
+## 0 at v=0) -- correct: mechanical dispersion requires flow, unlike
+## molecular diffusion, which is already handled as its own unconditional
+## term elsewhere.
+##
+## velocity_vectors: the WHOLE grid's precomputed _all_cell_velocity_vectors_m_s()
+## result, passed in rather than recomputed here -- see that function's doc
+## comment for why.
+func _face_dispersion_conductance_m3_s(axial_a: Vector2i, axial_b: Vector2i, offset: Vector2i, velocity_vectors: Dictionary) -> float:
+	var v_a: Vector2 = velocity_vectors[axial_a]
+	var v_b: Vector2 = velocity_vectors[axial_b]
+	var v_avg := (v_a + v_b) / 2.0
+	var speed := v_avg.length()
+	if speed <= 0.0:
+		return 0.0
+	var cos_theta := v_avg.dot(_direction_unit_vectors[offset]) / speed
+	var d_l := dispersivity_longitudinal_m * speed
+	var d_t := dispersivity_transverse_m * speed
+	var d_normal := d_t + (d_l - d_t) * cos_theta * cos_theta
+	var n_e := (get_porosity(axial_a) + get_porosity(axial_b)) / 2.0
+	return n_e * FACE_AREA_M2 * d_normal / CELL_SPACING_M
+
 ## All six neighbor face fluxes for one cell, keyed by neighbor axial --
 ## convenience for UI (cell inspector) and the future transport step, so
 ## neither needs to re-derive HexMath.neighbors() + face_flux_m_s() itself.
@@ -485,15 +692,43 @@ func total_mass_kg() -> float:
 func pore_volume_m3(axial: Vector2i) -> float:
 	return CELL_AREA_M2 * CELL_THICKNESS_M * get_porosity(axial)
 
-## Well-mixed concentration within a cell: its mass divided by its pore
-## volume. Zero for a cell with no pore volume (shouldn't happen with the
-## current geology table, since every porosity > 0, but a real porosity of
-## exactly 0.0 is physically valid, so guard it rather than divide by zero).
+## AQUEOUS (dissolved) concentration within a cell: mass_kg[axial] is the
+## cell's TOTAL contaminant inventory (dissolved + sorbed, brief SS12.3:
+## "either represent total equilibrium inventory with retardation or
+## explicitly track dissolved/sorbed pools; do not apply both independently"
+## -- this implementation takes the FIRST option, not the second, which is
+## why there is no separate "sorbed_mass_kg" dictionary: sorbed mass is a
+## derived fraction of mass_kg, not separately tracked state. For linear
+## equilibrium sorption, M_total = R_f * C * V_pore (see this file's header
+## comment above retardation_factor for the derivation from S = Kd*C), so
+## C = M_total / (R_f * V_pore) -- dividing by the ADDITIONAL retardation
+## factor on top of the plain mass/volume this always was is the entire
+## change Gate D makes to this function. Every caller of this function
+## (advective/diffusive/dispersive transfer, well capture, south-boundary
+## escape) already wants the AQUEOUS concentration, not the total inventory:
+## only dissolved mass moves with flowing water or diffuses, sorbed mass
+## stays on the solid matrix -- so retardation correctly falls out of every
+## one of those terms for free, without changing any of their own formulas.
+## Zero for a cell with no pore volume (shouldn't happen with the current
+## geology table, since every porosity > 0, but a real porosity of exactly
+## 0.0 is physically valid, so guard it rather than divide by zero).
 func get_concentration_kg_m3(axial: Vector2i) -> float:
 	var volume := pore_volume_m3(axial)
 	if volume <= 0.0:
 		return 0.0
-	return get_mass_kg(axial) / volume
+	return get_mass_kg(axial) / (get_retardation_factor(axial) * volume)
+
+## The DISSOLVED share of a cell's total inventory (brief SS12.5: "inspect
+## each cell's... sorbed inventory" wants both halves inspectable) --
+## get_concentration_kg_m3's own numerator, i.e. mass_kg[axial] / R_f, never
+## separately stored (see get_concentration_kg_m3's doc comment).
+func get_dissolved_mass_kg(axial: Vector2i) -> float:
+	return get_mass_kg(axial) / get_retardation_factor(axial)
+
+## The SORBED share: whatever of mass_kg[axial] isn't currently dissolved.
+## Always >= 0 since retardation_factor >= 1.0.
+func get_sorbed_mass_kg(axial: Vector2i) -> float:
+	return get_mass_kg(axial) - get_dissolved_mass_kg(axial)
 
 func _volumetric_flow_m3_s(axial_a: Vector2i, axial_b: Vector2i) -> float:
 	return face_flux_m_s(axial_a, axial_b) * FACE_AREA_M2
@@ -528,7 +763,10 @@ func _south_boundary_outflow_m3_s(axial: Vector2i) -> float:
 ## concentration happens to be higher at the time, so EITHER cell could be
 ## the one losing mass across this face on a given step -- the conservative
 ## (worst-case-for-stability) treatment is to count the face's full
-## diffusive conductance as potential outflow for both of them.
+## diffusive conductance as potential outflow for both of them. Mechanical
+## dispersion (_face_dispersion_conductance_m3_s, Gate C's second half) is
+## the SAME Fickian shape as diffusion -- no fixed direction either -- so it
+## gets the identical symmetric treatment, added onto the same accumulator.
 func max_stable_dt_s() -> float:
 	# Dictionary.keys() returns a plain (untyped) Array, so its elements are
 	# Variant -- explicitly typing the loop variable (not just `for axial in
@@ -539,6 +777,7 @@ func max_stable_dt_s() -> float:
 	var outflow_total: Dictionary = {}
 	for axial: Vector2i in top_elevation_m.keys():
 		outflow_total[axial] = 0.0
+	var velocity_vectors := _all_cell_velocity_vectors_m_s()
 	for axial: Vector2i in top_elevation_m.keys():
 		for face_offset in _TRANSPORT_EDGE_OFFSETS:
 			var neighbor: Vector2i = axial + face_offset
@@ -552,6 +791,9 @@ func max_stable_dt_s() -> float:
 			var g_diff := _face_diffusion_conductance_m3_s(axial, neighbor)
 			outflow_total[axial] += g_diff
 			outflow_total[neighbor] += g_diff
+			var g_disp := _face_dispersion_conductance_m3_s(axial, neighbor, face_offset, velocity_vectors)
+			outflow_total[axial] += g_disp
+			outflow_total[neighbor] += g_disp
 		for boundary_offset in _SOUTH_OUTFLOW_OFFSETS:
 			if top_elevation_m.has(axial + boundary_offset):
 				continue # a real cell is there; that face is already counted above, from one side or the other
@@ -562,32 +804,48 @@ func max_stable_dt_s() -> float:
 		var outflow: float = outflow_total[axial]
 		if outflow <= 0.0:
 			continue
-		min_dt = minf(min_dt, pore_volume_m3(axial) / outflow)
+		# Every term accumulated into outflow_total above eventually multiplies
+		# get_concentration_kg_m3(axial) in step_transport(), which Gate D's
+		# retardation already shrinks by 1/R_f (see that function's doc
+		# comment) -- so the fraction of mass_kg[axial] actually removed per
+		# second is outflow/(R_f*pore_volume), not outflow/pore_volume. Scaling
+		# the stability bound by R_f here (rather than threading it through
+		# every term above) keeps this the one place that has to know it:
+		# retardation makes a cell's TOTAL inventory drain slower, so this
+		# only ever relaxes (never tightens) the bound.
+		min_dt = minf(min_dt, get_retardation_factor(axial) * pore_volume_m3(axial) / outflow)
 	return min_dt
 
-## Advances contaminant mass by dt_s seconds: conservative, one-layer,
-## advection PLUS molecular diffusion (brief SS8 Phase 1 step 5 + SS12.6
-## Gate C -- mechanical dispersion/sorption/reactions are still later, not
-## yet implemented work). Advection uses an upwind scheme: mass crossing a
-## face moves at that face's volumetric flow rate, carrying the UPSTREAM
-## cell's concentration (whichever side the flux actually flows from), the
-## standard way to keep an explicit advection scheme stable and conservative.
-## Diffusion is added on top of that at the SAME face, independently: Fick's
-## law doesn't care about flow direction, it moves mass from higher to lower
-## concentration regardless of which way (or whether) water is flowing there
-## -- see _face_diffusion_conductance_m3_s's doc comment for the governing
-## equation. Every edge's transfer (both terms) is computed once from
+## Advances contaminant mass by dt_s seconds: conservative, one-layer
+## advection PLUS molecular diffusion PLUS mechanical dispersion (brief SS8
+## Phase 1 step 5 + SS12.6 Gate C), PLUS Gate D's linear equilibrium sorption/
+## retardation -- the latter needs no separate term here at all, since it
+## only ever acts through get_concentration_kg_m3() shrinking the AQUEOUS
+## concentration every term below already uses (see that function's doc
+## comment). Reactions/degradation (Gate D's other half) remain unimplemented.
+## Advection uses an upwind scheme: mass
+## crossing a face moves at that face's volumetric flow rate, carrying the
+## UPSTREAM cell's concentration (whichever side the flux actually flows
+## from), the standard way to keep an explicit advection scheme stable and
+## conservative. Diffusion and dispersion are both added on top of that at
+## the SAME face, independently: neither cares about flow direction the way
+## advection does, both move mass from higher to lower concentration
+## regardless of which way (or, for diffusion alone, whether) water is
+## flowing there -- see _face_diffusion_conductance_m3_s/
+## _face_dispersion_conductance_m3_s's doc comments for the governing
+## equations. Every edge's transfer (all three terms) is computed once from
 ## pre-step concentrations (into `delta`) and applied only after the full
 ## pass, so processing order can never let one edge's update affect
 ## another's within the same step.
 ##
-## SCOPE of this first diffusion pass: interior cell-to-cell faces only. The
-## open south boundary and the capture well do NOT yet diffuse (both still
-## only move mass via their existing advective/specified-rate terms) --
-## deliberately deferred rather than guessed at: diffusion across an open
-## boundary needs its own documented assumption (what's the concentration
-## "outside" the modeled domain?) that doesn't yet have a clear answer, and
-## nothing in brief SS12.4's required test list (1-5) needs it to exist yet.
+## SCOPE, same for diffusion and dispersion alike: interior cell-to-cell
+## faces only. The open south boundary and the capture well do NOT diffuse or
+## disperse (both still only move mass via their existing advective/
+## specified-rate terms) -- deliberately deferred rather than guessed at: an
+## open boundary needs its own documented assumption (what's the
+## concentration/velocity "outside" the modeled domain?) that doesn't yet
+## have a clear answer, and nothing in brief SS12.4's required test list
+## needs it to exist yet.
 ##
 ## Cells on the open downstream boundary (_SOUTH_OUTFLOW_OFFSETS) ALSO lose
 ## mass through _south_boundary_outflow_m3_s each such face -- that mass
@@ -618,6 +876,7 @@ func step_transport(dt_s: float) -> void:
 	var delta: Dictionary = {}
 	for axial: Vector2i in top_elevation_m.keys():
 		delta[axial] = 0.0
+	var velocity_vectors := _all_cell_velocity_vectors_m_s()
 	for axial: Vector2i in top_elevation_m.keys():
 		for face_offset in _TRANSPORT_EDGE_OFFSETS:
 			var neighbor: Vector2i = axial + face_offset
@@ -629,13 +888,17 @@ func step_transport(dt_s: float) -> void:
 				transfer_kg = q * get_concentration_kg_m3(axial) * dt_s
 			elif q < 0.0:
 				transfer_kg = q * get_concentration_kg_m3(neighbor) * dt_s # q<0 * conc(neighbor) -> negative transfer, i.e. mass actually flows neighbor -> axial
-			# Diffusion: independent of q/flow direction entirely, always
-			# down the CONCENTRATION gradient (Fick's law) -- positive when
-			# axial is more concentrated than neighbor, same delta sign
-			# convention as the advective term above, so the two simply add.
+			# Diffusion AND mechanical dispersion: both independent of q/flow
+			# direction entirely, always down the CONCENTRATION gradient
+			# (Fick's law) -- positive when axial is more concentrated than
+			# neighbor, same delta sign convention as the advective term
+			# above, so all three simply add.
 			var g_diff := _face_diffusion_conductance_m3_s(axial, neighbor)
 			if g_diff > 0.0:
 				transfer_kg += g_diff * (get_concentration_kg_m3(axial) - get_concentration_kg_m3(neighbor)) * dt_s
+			var g_disp := _face_dispersion_conductance_m3_s(axial, neighbor, face_offset, velocity_vectors)
+			if g_disp > 0.0:
+				transfer_kg += g_disp * (get_concentration_kg_m3(axial) - get_concentration_kg_m3(neighbor)) * dt_s
 			delta[axial] -= transfer_kg
 			delta[neighbor] += transfer_kg
 		for boundary_offset in _SOUTH_OUTFLOW_OFFSETS:

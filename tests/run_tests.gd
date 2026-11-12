@@ -42,6 +42,12 @@ func _init() -> void:
 	failures += _test_grid_model_zero_gradient_no_transport()
 	failures += _test_grid_model_pure_diffusion_spreads_at_zero_velocity()
 	failures += _test_grid_model_diffusion_included_in_cfl_bound()
+	failures += _test_grid_model_dispersion_tensor_projection()
+	failures += _test_grid_model_dispersion_inactive_at_zero_velocity()
+	failures += _test_grid_model_dispersion_included_in_cfl_bound()
+	failures += _test_grid_model_retardation_factor_formula()
+	failures += _test_grid_model_dissolved_sorbed_mass_split()
+	failures += _test_grid_model_retardation_delays_transport()
 	failures += _test_grid_model_transport_direction()
 	failures += _test_grid_model_south_boundary_outflow()
 	failures += _test_grid_model_reset_mass()
@@ -90,6 +96,8 @@ func _init() -> void:
 	failures += _test_feature_overlap_depth_rule()
 	failures += _test_tree_sway_and_shadow()
 	failures += _test_world_sandbox_mode()
+	failures += _test_world_footprint_anchor_shift()
+	failures += _test_world_sandbox_feature_with_footprint()
 	failures += _test_rocky_terrain_boulder_coupling()
 	failures += _test_mountains_concentrate_north()
 	failures += _test_major_feature_scatter()
@@ -468,8 +476,8 @@ func _test_grid_model_concentration() -> int:
 	var expected_volume: float = GridModel.CELL_AREA_M2 * GridModel.CELL_THICKNESS_M * model.get_porosity(axial)
 	f += _check(is_equal_approx(model.pore_volume_m3(axial), expected_volume),
 		"pore volume matches cell area x thickness x porosity")
-	f += _check(is_equal_approx(model.get_concentration_kg_m3(axial), 15.0 / expected_volume),
-		"concentration matches mass / pore volume")
+	f += _check(is_equal_approx(model.get_concentration_kg_m3(axial), 15.0 / (model.get_retardation_factor(axial) * expected_volume)),
+		"concentration matches mass / (retardation_factor * pore volume) -- Gate D's default Kd table is nonzero everywhere, so even this basic check must account for retardation now")
 	return f
 
 ## Brief SS9's non-negotiable guardrail: "mass conservation" -- no contaminant
@@ -592,6 +600,185 @@ func _test_grid_model_diffusion_included_in_cfl_bound() -> int:
 	var diffusive := GridModel.new(8, {}, {}, huge_diffusion)
 	f += _check(diffusive.max_stable_dt_s() < baseline_dt,
 		"a much larger diffusion coefficient is included in the CFL stability bound -- it shrinks the stable step, same as a stronger well or higher K would")
+	return f
+
+## Brief SS12.2/SS12.3/SS12.6 Gate C's second half, SS12.4 test 6:
+## "Longitudinal vs transverse dispersion: elongation follows flow direction
+## and broadening follows transverse dispersivity." Tests
+## _face_dispersion_conductance_m3_s directly with a HAND-CONSTRUCTED
+## velocity_vectors dictionary (not a solved flow field) so the local flow
+## direction relative to the face normal is exact and known, not merely
+## approximately aligned with one of the hex grid's own 6 discrete
+## directions: flow set EXACTLY parallel to a face's own normal must disperse
+## at exactly the longitudinal coefficient (alpha_L * |v|); flow set EXACTLY
+## perpendicular to it must disperse at exactly the transverse coefficient
+## (alpha_T * |v|) -- the standard 2D dispersion-tensor projection formula,
+## D_normal = D_T + (D_L - D_T) * cos(theta)^2, evaluated at its two
+## endpoints (cos(theta) = 1 and 0).
+func _test_grid_model_dispersion_tensor_projection() -> int:
+	var f := 0
+	var model := GridModel.new(8)
+	model.set_dispersivity(10.0, 1.0) # alpha_L, alpha_T -- same as the defaults, explicit here for clarity
+	var a := Vector2i(0, 0)
+	var b := Vector2i(1, 0)
+	var offset := Vector2i(1, 0) # one of GridModel's own _TRANSPORT_EDGE_OFFSETS
+	var n_hat: Vector2 = model._direction_unit_vectors[offset]
+	var speed := 1.0e-5 # m/s -- an arbitrary nonzero pore velocity magnitude
+	var n_e: float = (model.get_porosity(a) + model.get_porosity(b)) / 2.0
+
+	var aligned_velocity: Dictionary = {a: n_hat * speed, b: n_hat * speed}
+	var g_aligned: float = model._face_dispersion_conductance_m3_s(a, b, offset, aligned_velocity)
+	var expected_g_aligned: float = n_e * GridModel.FACE_AREA_M2 * (model.dispersivity_longitudinal_m * speed) / GridModel.CELL_SPACING_M
+	f += _check(is_equal_approx(g_aligned, expected_g_aligned),
+		"flow exactly aligned with a face's own normal direction disperses at exactly the LONGITUDINAL coefficient (alpha_L * |v|)")
+
+	var perpendicular: Vector2 = Vector2(-n_hat.y, n_hat.x) * speed # n_hat rotated 90 degrees -- exactly transverse to the face normal, by construction
+	var perp_velocity: Dictionary = {a: perpendicular, b: perpendicular}
+	var g_perp: float = model._face_dispersion_conductance_m3_s(a, b, offset, perp_velocity)
+	var expected_g_perp: float = n_e * GridModel.FACE_AREA_M2 * (model.dispersivity_transverse_m * speed) / GridModel.CELL_SPACING_M
+	f += _check(is_equal_approx(g_perp, expected_g_perp),
+		"flow exactly perpendicular to a face's own normal direction disperses at exactly the TRANSVERSE coefficient (alpha_T * |v|), not the longitudinal one")
+
+	f += _check(g_aligned > g_perp,
+		"longitudinal dispersion (along the flow) is stronger than transverse (across it) with alpha_L > alpha_T -- brief SS12.4 test 6's qualitative requirement")
+
+	var zero_velocity: Dictionary = {a: Vector2.ZERO, b: Vector2.ZERO}
+	f += _check(is_zero_approx(model._face_dispersion_conductance_m3_s(a, b, offset, zero_velocity)),
+		"zero local flow velocity means zero mechanical dispersion regardless of dispersivity -- it requires flow, unlike molecular diffusion")
+	return f
+
+## Mirrors _test_grid_model_pure_diffusion_spreads_at_zero_velocity, but for
+## mechanical dispersion: a flat head field (zero face flux, zero velocity
+## everywhere) with molecular diffusion explicitly zeroed out (isolating
+## dispersion) and a deliberately huge dispersivity must still move exactly
+## zero mass, confirming D_L/D_T's |v| factor -- not just the tensor-
+## projection formula tested in isolation above -- actually zeroes out
+## end-to-end through a real step_transport() call.
+func _test_grid_model_dispersion_inactive_at_zero_velocity() -> int:
+	var f := 0
+	var zero_diffusion := {GridModel.Geology.SAND: 0.0, GridModel.Geology.SILT: 0.0, GridModel.Geology.CLAY: 0.0}
+	var model := GridModel.new(8, {}, {}, zero_diffusion)
+	for axial: Vector2i in model.head_m.keys():
+		model.head_m[axial] = 50.0 # flat head everywhere -- zero gradient, zero face flux, zero velocity
+	model.set_dispersivity(1000.0, 1000.0) # deliberately huge -- set_dispersivity doesn't re-solve heads (see its own doc comment), so the flattened head field above survives this call
+
+	var source := Vector2i(0, 0)
+	model.seed_mass_kg(source, 1000.0)
+	var mass_before: float = model.get_mass_kg(source)
+
+	model.step_transport(1.0e7) # an arbitrarily large dt -- with zero velocity everywhere, nothing should move regardless of step size or dispersivity
+	f += _check(is_equal_approx(model.get_mass_kg(source), mass_before),
+		"mechanical dispersion moves no mass at all when the local flow velocity is exactly zero, no matter how large the dispersivity is set")
+	return f
+
+## Mirrors _test_grid_model_diffusion_included_in_cfl_bound: mechanical
+## dispersion must also shrink the CFL-stable step, same as every other
+## outflow term max_stable_dt_s() already accounts for.
+func _test_grid_model_dispersion_included_in_cfl_bound() -> int:
+	var f := 0
+	var baseline := GridModel.new(8)
+	var baseline_dt: float = baseline.max_stable_dt_s()
+
+	var dispersive := GridModel.new(8)
+	dispersive.set_dispersivity(500.0, 500.0) # deliberately far beyond the realistic default, to guarantee a visibly smaller stable step
+	f += _check(dispersive.max_stable_dt_s() < baseline_dt,
+		"a much larger dispersivity is included in the CFL stability bound -- it shrinks the stable step, same as a stronger well, higher K, or larger diffusion coefficient would")
+	return f
+
+## Brief SS12.2/SS12.3/SS12.6 Gate D: confirms get_retardation_factor matches
+## R_f = 1 + rho_b*Kd/n_e exactly, and get_bulk_density_kg_m3 matches
+## rho_particle*(1-n_e) -- both derivations spelled out in grid_model.gd's own
+## doc comments above retardation_factor/PARTICLE_DENSITY_KG_M3. Reads
+## whatever geology a.(0,0) happens to be (rather than assuming one) and
+## compares against that SAME geology's own table entries, so this test stays
+## correct even if _geology_at's deterministic formula is ever revisited.
+func _test_grid_model_retardation_factor_formula() -> int:
+	var f := 0
+	var model := GridModel.new(8)
+	var axial := Vector2i(0, 0)
+	var geo: int = model.get_geology(axial)
+	var kd: float = model.geology_kd_m3_kg[geo]
+	var n_e: float = model.geology_porosity[geo]
+	var expected_bulk_density: float = GridModel.PARTICLE_DENSITY_KG_M3 * (1.0 - n_e)
+	var expected_r_f: float = 1.0 + expected_bulk_density * kd / n_e
+
+	f += _check(is_equal_approx(model.get_bulk_density_kg_m3(axial), expected_bulk_density),
+		"bulk density derives from porosity via rho_particle * (1 - n_e)")
+	f += _check(is_equal_approx(model.get_retardation_factor(axial), expected_r_f),
+		"retardation_factor matches R_f = 1 + rho_b*Kd/n_e exactly")
+	f += _check(model.get_retardation_factor(axial) > 1.0,
+		"the default Kd table is nonzero everywhere, so every cell retards (R_f > 1), not just clay")
+	return f
+
+## Confirms get_concentration_kg_m3's own division by R_f (Gate D's entire
+## implementation, per that function's doc comment) exactly reconstructs a
+## dissolved/sorbed split that always sums back to the full inventory --
+## brief SS12.5 wants both halves inspectable even though only mass_kg is
+## actually stored.
+func _test_grid_model_dissolved_sorbed_mass_split() -> int:
+	var f := 0
+	var model := GridModel.new(8)
+	var axial := Vector2i(0, 0)
+	model.seed_mass_kg(axial, 500.0)
+	var r_f := model.get_retardation_factor(axial)
+
+	f += _check(is_equal_approx(model.get_dissolved_mass_kg(axial), 500.0 / r_f),
+		"dissolved mass is total mass divided by the retardation factor")
+	f += _check(is_equal_approx(model.get_dissolved_mass_kg(axial) + model.get_sorbed_mass_kg(axial), 500.0),
+		"dissolved + sorbed mass exactly reconstructs the total -- no mass invented or lost by the split")
+	f += _check(model.get_sorbed_mass_kg(axial) >= 0.0, "sorbed mass is never negative")
+	f += _check(is_equal_approx(model.get_concentration_kg_m3(axial), model.get_mass_kg(axial) / (r_f * model.pore_volume_m3(axial))),
+		"get_concentration_kg_m3 matches mass_kg / (R_f * pore_volume) exactly")
+	return f
+
+## Brief SS12.4 test 7: "Retardation: breakthrough delayed by expected factor
+## for an equilibrium linear sorption benchmark." Uses a HOMOGENEOUS aquifer
+## (K and porosity overridden to the SAME value for sand/silt/clay, same
+## idiom _test_grid_model_head_gradient_uniform_k_benchmark already uses) so
+## `baseline` and `retarded` share an IDENTICAL solved head/flux field --
+## retardation_factor never enters _solve_heads() at all, so the only
+## difference between the two models is Kd. Diffusion and dispersion are both
+## zeroed out to isolate pure advection, so the comparison is exact, not just
+## directionally correct.
+##
+## Exact expected relationship for ONE transport step from the same seeded
+## mass: transfer = Q * (M_source / (R_f * V_pore)) * dt, so with identical Q,
+## M_source and dt between the two models, transferred_retarded must equal
+## transferred_baseline / R_f EXACTLY -- not merely "less", the precise
+## factor the brief's test 7 asks for.
+func _test_grid_model_retardation_delays_transport() -> int:
+	var f := 0
+	var uniform_k := {GridModel.Geology.SAND: 3.0e-4, GridModel.Geology.SILT: 3.0e-4, GridModel.Geology.CLAY: 3.0e-4}
+	var uniform_porosity := {GridModel.Geology.SAND: 0.3, GridModel.Geology.SILT: 0.3, GridModel.Geology.CLAY: 0.3}
+	var zero_diffusion := {GridModel.Geology.SAND: 0.0, GridModel.Geology.SILT: 0.0, GridModel.Geology.CLAY: 0.0}
+	var no_kd := {GridModel.Geology.SAND: 0.0, GridModel.Geology.SILT: 0.0, GridModel.Geology.CLAY: 0.0}
+
+	var target_r_f := 3.0
+	var bulk_density: float = GridModel.PARTICLE_DENSITY_KG_M3 * (1.0 - 0.3)
+	var kd_val: float = (target_r_f - 1.0) * 0.3 / bulk_density # solved from R_f = 1 + rho_b*Kd/n_e for Kd, so this test derives its own input rather than guessing a "nice" constant
+	var uniform_kd := {GridModel.Geology.SAND: kd_val, GridModel.Geology.SILT: kd_val, GridModel.Geology.CLAY: kd_val}
+
+	var baseline := GridModel.new(8, uniform_k, uniform_porosity, zero_diffusion, no_kd)
+	baseline.set_dispersivity(0.0, 0.0)
+	var retarded := GridModel.new(8, uniform_k, uniform_porosity, zero_diffusion, uniform_kd)
+	retarded.set_dispersivity(0.0, 0.0)
+
+	var source := Vector2i(0, 0)
+	baseline.seed_mass_kg(source, 1000.0)
+	retarded.seed_mass_kg(source, 1000.0)
+
+	f += _check(is_equal_approx(retarded.get_retardation_factor(source), target_r_f),
+		"the hand-solved Kd override produces exactly the intended retardation factor at the source cell")
+
+	var dt: float = baseline.max_stable_dt_s() * 0.5 # baseline's bound is safe for `retarded` too -- an identical flow field plus R_f >= 1 only ever relaxes the CFL bound, never tightens it
+	baseline.step_transport(dt)
+	retarded.step_transport(dt)
+
+	var transferred_baseline: float = 1000.0 - baseline.get_mass_kg(source)
+	var transferred_retarded: float = 1000.0 - retarded.get_mass_kg(source)
+	f += _check(transferred_baseline > 0.0, "sanity check: the unretarded baseline model actually moved mass in this one step")
+	f += _check(is_equal_approx(transferred_retarded, transferred_baseline / target_r_f),
+		"retardation delays breakthrough by EXACTLY the expected factor: with an identical flow field and one identical transport step, the retarded model transfers exactly 1/R_f as much mass as the unretarded one")
 	return f
 
 ## Confirms transport actually moves mass, and in the physically correct
@@ -1281,6 +1468,106 @@ func _test_world_sandbox_mode() -> int:
 	world.free()
 	return f
 
+## User's 2026-11-10 ask: "larger terrain features" (a farm/wetland composite
+## drawn to span several hex cells, not just a bigger prop sitting on one) --
+## see FeaturePlacement.footprint_offsets' own doc comment. Confirms
+## _footprint_anchor_shift returns exactly ZERO for the empty (default) case
+## -- every placement predating this field must be completely unaffected --
+## and, for a real footprint, matches a from-scratch recomputation using
+## cell_centre_in_features directly (the same real on-screen positions
+## everything else in this project is placed against), not a hardcoded pixel
+## number that could quietly stop matching this project's actual tile
+## geometry if it's ever retuned.
+func _test_world_footprint_anchor_shift() -> int:
+	var f := 0
+	var world = _make_world()
+	var axial := Vector2i(0, -3)
+
+	var no_offsets: Array[Vector2i] = []
+	f += _check(world._footprint_anchor_shift(axial, no_offsets) == Vector2.ZERO,
+		"an empty footprint (every placement predating this feature) shifts the anchor by exactly nothing")
+
+	var single_offset: Array[Vector2i] = [Vector2i(0, 1)]
+	var expected_single: Vector2 = (world.cell_centre_in_features(axial + Vector2i(0, 1)) - world.cell_centre_in_features(axial)) / 2.0
+	f += _check(world._footprint_anchor_shift(axial, single_offset).is_equal_approx(expected_single),
+		"a single-offset footprint's centroid is exactly halfway between axial and that one other cell")
+
+	# This project's own receptor_farm.png: a symmetric diamond of 4 hexes --
+	# axial (the top), its lower-left and lower-right neighbors, and the
+	# straight-down cell beyond them (see feature_placement.gd's own doc
+	# comment for the full derivation of these 3 offsets).
+	var diamond_offsets: Array[Vector2i] = [Vector2i(-1, 1), Vector2i(1, 0), Vector2i(0, 1)]
+	var base: Vector2 = world.cell_centre_in_features(axial) # `world` is _make_world()'s generic Node return, so the method's own Vector2 return type must be spelled out explicitly here (unlike := world.new()-typed World variables elsewhere in this file)
+	var expected_diamond: Vector2 = (
+		(world.cell_centre_in_features(axial + Vector2i(-1, 1)) - base) +
+		(world.cell_centre_in_features(axial + Vector2i(1, 0)) - base) +
+		(world.cell_centre_in_features(axial + Vector2i(0, 1)) - base)
+	) / 4.0 # +1 for axial's own zero delta
+	f += _check(world._footprint_anchor_shift(axial, diamond_offsets).is_equal_approx(expected_diamond),
+		"a 4-cell diamond footprint's centroid matches a from-scratch average of all 4 cells' real positions")
+	# A symmetric diamond's centroid must land exactly between the top and
+	# bottom hex, i.e. the x shift must be zero (the two middle hexes'
+	# opposite x offsets exactly cancel) -- a real geometric property of this
+	# specific shape, not just "whatever the formula outputs".
+	f += _check(is_zero_approx(expected_diamond.x),
+		"sanity check: this diamond shape is symmetric left-right, so its centroid has no horizontal offset from the top hex")
+
+	world.free()
+	return f
+
+## End-to-end: a sandbox_features entry with footprint_offsets set must
+## actually shift the placed sprite's offset by _footprint_anchor_shift's own
+## result, on top of the usual center/bottom-center anchor and nudge --
+## confirms the wiring in _add_sandbox_features, not just the helper formula
+## in isolation (covered above).
+func _test_world_sandbox_feature_with_footprint() -> int:
+	var f := 0
+	var world = World.new()
+	world.minimal_test_mode = false
+	world.procedural_generation = false
+	var ground_node := TileMapLayer.new()
+	var features_node := Node2D.new()
+	world.add_child(ground_node)
+	world.add_child(features_node)
+	world.ground = ground_node
+	world.features = features_node
+
+	world._build_tileset()
+	world._model = GridModel.new(world.radius)
+	var bounds: Vector2 = world._model.elevation_range()
+	world._elevation_lo = bounds.x
+	world._elevation_hi = bounds.y
+	world._river_cells.clear()
+
+	var axial := Vector2i(0, -3)
+	var offsets: Array[Vector2i] = [Vector2i(0, 1)]
+	var placement := FeaturePlacement.new()
+	placement.axial = axial
+	placement.texture = World.ROCKS[0]
+	placement.is_tree = false
+	placement.footprint_offsets = offsets
+	placement.nudge = Vector2(3.0, -2.0)
+	var placements: Array[FeaturePlacement] = [placement]
+	world.sandbox_features = placements
+
+	world._build_features()
+
+	var root: Node2D = null
+	for child in world.features.get_children():
+		if child.get_child_count() > 0 and (child.get_child(0) as Sprite2D).texture == World.ROCKS[0]:
+			root = child
+	f += _check(root != null, "the footprint-bearing sandbox feature still gets placed")
+
+	var tex: Texture2D = World.ROCKS[0]
+	var shift := world._footprint_anchor_shift(axial, offsets)
+	var expected_anchor := Vector2(tex.get_width() / 2.0, tex.get_height() / 2.0) - shift
+	var sprite: Sprite2D = root.get_child(0)
+	f += _check(sprite.offset.is_equal_approx(-expected_anchor + placement.nudge),
+		"a footprint-bearing feature's sprite offset is shifted by _footprint_anchor_shift on top of the usual center anchor and nudge")
+
+	world.free()
+	return f
+
 ## TERRAIN_ROCKY couples a cell's ground art to whether it got a boulder
 ## feature (see _terrain_for's doc comment) -- confirms that coupling
 ## actually holds (every rocky cell's placed ground tile uses the rocky
@@ -1865,6 +2152,8 @@ func _test_world_cell_info() -> int:
 	f += _check(is_equal_approx(info["k_m_s"], world._model.get_k(axial)), "cell_info's k_m_s matches GridModel")
 	f += _check(is_equal_approx(info["porosity"], world._model.get_porosity(axial)), "cell_info's porosity matches GridModel")
 	f += _check(is_equal_approx(info["diffusion_m2_s"], world._model.get_diffusion_m2_s(axial)), "cell_info's diffusion_m2_s matches GridModel")
+	f += _check(is_equal_approx(info["kd_m3_kg"], world._model.get_kd_m3_kg(axial)), "cell_info's kd_m3_kg matches GridModel")
+	f += _check(is_equal_approx(info["retardation_factor"], world._model.get_retardation_factor(axial)), "cell_info's retardation_factor matches GridModel")
 	f += _check(is_equal_approx(info["head_m"], world._model.get_head(axial)), "cell_info's head_m matches GridModel")
 	f += _check(is_equal_approx(info["concentration_kg_m3"], world._model.get_concentration_kg_m3(axial)),
 		"cell_info's concentration_kg_m3 matches GridModel")
@@ -1890,6 +2179,8 @@ func _test_hex_selection_format_cell_info() -> int:
 		"k_m_s": 3.0e-4,
 		"porosity": 0.3,
 		"diffusion_m2_s": 1.0e-9,
+		"kd_m3_kg": 2.0e-4,
+		"retardation_factor": 2.24,
 		"head_m": 47.6,
 		"contamination_percent": 12.345,
 	}
@@ -1904,6 +2195,7 @@ func _test_hex_selection_format_cell_info() -> int:
 		"formatted cell info shows K in scientific notation (spans orders of magnitude)")
 	f += _check(text.contains("e-09") or text.contains("e-9"),
 		"formatted cell info shows the diffusion coefficient in scientific notation too")
+	f += _check(text.contains("2.24"), "formatted cell info shows the retardation factor (Gate D)")
 	f += _check(text.contains("12.3") and text.contains("%"),
 		"formatted cell info includes the contamination percentage")
 	selection.free()
@@ -2066,7 +2358,12 @@ func _test_plume_overlay_fraction() -> int:
 
 	var f := 0
 	f += _check(overlay._fraction(Vector2i(0, 0)) == 0.0, "zero concentration is a zero fraction")
-	overlay._model.mass_kg[Vector2i(0, 0)] = 0.03 * GridModel.CELL_AREA_M2 * GridModel.CELL_THICKNESS_M * overlay._model.get_porosity(Vector2i(0, 0))
+	# Gate D's default Kd table means get_concentration_kg_m3 now divides by
+	# get_retardation_factor() too (see that function's doc comment) -- so
+	# hitting a TARGET concentration by hand-setting mass_kg directly must
+	# multiply by it, same as the real formula does.
+	var r_f: float = overlay._model.get_retardation_factor(Vector2i(0, 0))
+	overlay._model.mass_kg[Vector2i(0, 0)] = r_f * 0.03 * GridModel.CELL_AREA_M2 * GridModel.CELL_THICKNESS_M * overlay._model.get_porosity(Vector2i(0, 0))
 	f += _check(is_equal_approx(overlay._fraction(Vector2i(0, 0)), 1.0),
 		"concentration exactly at full_scale is a fraction of 1.0")
 	overlay._model.mass_kg[Vector2i(0, 0)] *= 2.0

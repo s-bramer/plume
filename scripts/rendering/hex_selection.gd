@@ -114,7 +114,7 @@ func _update_info_panel() -> void:
 ## GridOutline's _is_shore_edge split from its actual draw_line call.
 func _format_cell_info(info: Dictionary) -> String:
 	var axial: Vector2i = info["axial"]
-	return "Cell (%d, %d)\nTerrain: %s\nElevation: %.1f m\nGeology: %s\nK: %s m/s\nPorosity: %.2f\nDiffusion: %s m2/s\nHead: %.1f m\nContamination: %.1f%%" % [
+	return "Cell (%d, %d)\nTerrain: %s\nElevation: %.1f m\nGeology: %s\nK: %s m/s\nPorosity: %.2f\nDiffusion: %s m2/s\nKd: %s m3/kg\nRetardation: %.2fx\nHead: %.1f m\nContamination: %.1f%%" % [
 		axial.x, axial.y,
 		info["terrain_name"],
 		info["elevation_m"],
@@ -122,6 +122,8 @@ func _format_cell_info(info: Dictionary) -> String:
 		_format_scientific(info["k_m_s"]),
 		info["porosity"],
 		_format_scientific(info["diffusion_m2_s"]),
+		_format_scientific(info["kd_m3_kg"]),
+		info["retardation_factor"],
 		info["head_m"],
 		info["contamination_percent"],
 	]

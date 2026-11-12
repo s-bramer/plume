@@ -360,6 +360,44 @@ const DECORATION_DENSITY := 0.45
 		clay_diffusion_m2_s = value
 		_refresh_geology_parameters()
 
+## Brief SS12.2/SS12.3/SS12.6 Gate D: linear equilibrium sorption
+## distribution coefficient per geology -- see
+## GridModel.DEFAULT_GEOLOGY_KD_M3_KG's doc comment for why this is a
+## per-geology table (like K/porosity/diffusion above) rather than a single
+## scenario-wide value (like dispersivity below): Kd genuinely depends on
+## sediment type, the same real-physics reasoning that makes K per-geology.
+## Same live-tuning setter pattern as every other geology export here.
+@export_range(1.0e-6, 1.0e-2, 1.0e-6, "exp") var sand_kd_m3_kg: float = 2.0e-4:
+	set(value):
+		sand_kd_m3_kg = value
+		_refresh_geology_parameters()
+@export_range(1.0e-6, 1.0e-2, 1.0e-6, "exp") var silt_kd_m3_kg: float = 8.0e-4:
+	set(value):
+		silt_kd_m3_kg = value
+		_refresh_geology_parameters()
+@export_range(1.0e-6, 1.0e-2, 1.0e-6, "exp") var clay_kd_m3_kg: float = 3.0e-3:
+	set(value):
+		clay_kd_m3_kg = value
+		_refresh_geology_parameters()
+
+## Brief SS12.2/SS12.3/SS12.6 Gate C's second half: mechanical dispersion --
+## see GridModel.DEFAULT_DISPERSIVITY_LONGITUDINAL_M's doc comment for why
+## this is a single scenario-wide pair rather than a per-geology table like
+## K/porosity/diffusion above (dispersivity is primarily scale-dependent,
+## not a clean function of lithology -- the brief's own caveat). Same
+## live-tuning setter pattern as every other transport export here, but via
+## GridModel.set_dispersivity (no head re-solve needed -- dispersivity
+## doesn't affect the flow field, only how transport spreads mass through
+## it).
+@export_range(0.0, 50.0, 0.1) var dispersivity_longitudinal_m: float = 10.0:
+	set(value):
+		dispersivity_longitudinal_m = value
+		_refresh_dispersivity()
+@export_range(0.0, 10.0, 0.1) var dispersivity_transverse_m: float = 1.0:
+	set(value):
+		dispersivity_transverse_m = value
+		_refresh_dispersivity()
+
 ## Brief SS8 Phase 1 step 7: "...a physically defensible player remediation
 ## choice (e.g. a capture well with specified pumping rate)". well_axial is
 ## where the well is drilled; well_pumping_rate_m3_s is how hard it pumps
@@ -561,6 +599,7 @@ func _ready() -> void:
 	_model = GridModel.new(radius)
 	_refresh_geology_parameters() # applies the current sand/silt/clay K & porosity exports immediately, rather than duplicating the override-dict construction here too
 	_refresh_well() # ditto for the capture well's location/pumping rate
+	_refresh_dispersivity() # ditto for the mechanical-dispersion exports
 	var bounds := _model.elevation_range()
 	_elevation_lo = bounds.x
 	_elevation_hi = bounds.y
@@ -602,15 +641,16 @@ func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventKey and event.pressed and not event.echo and event.keycode == KEY_SPACE:
 		_advance_turn()
 
-## Pushes the current sand/silt/clay K, porosity & diffusion exports into the
-## running GridModel and forces the two overlays that depend on them to
+## Pushes the current sand/silt/clay K, porosity, diffusion & Kd exports into
+## the running GridModel and forces the two overlays that depend on them to
 ## redraw -- called from _ready() AND from each geology export's own setter,
 ## so an Inspector edit made while playing takes effect on the very next
 ## frame, not just at the next restart (see those exports' doc comment for
 ## the bug this fixes). GridModel.apply_geology_parameters re-derives
-## k_m_s/porosity/diffusion_m2_s per cell from each cell's EXISTING
-## geology_id -- it never touches elevation/geology/head/mass_kg, so a live
-## tweak doesn't reset the plume's current position or the turn in progress.
+## k_m_s/porosity/diffusion_m2_s/kd_m3_kg/retardation_factor per cell from
+## each cell's EXISTING geology_id -- it never touches elevation/geology/
+## head/mass_kg, so a live tweak doesn't reset the plume's current position
+## or the turn in progress.
 func _refresh_geology_parameters() -> void:
 	if _model == null:
 		return
@@ -626,6 +666,10 @@ func _refresh_geology_parameters() -> void:
 		GridModel.Geology.SAND: sand_diffusion_m2_s,
 		GridModel.Geology.SILT: silt_diffusion_m2_s,
 		GridModel.Geology.CLAY: clay_diffusion_m2_s,
+	}, {
+		GridModel.Geology.SAND: sand_kd_m3_kg,
+		GridModel.Geology.SILT: silt_kd_m3_kg,
+		GridModel.Geology.CLAY: clay_kd_m3_kg,
 	})
 	if flow_overlay != null:
 		flow_overlay.queue_redraw()
@@ -651,6 +695,18 @@ func _refresh_well() -> void:
 		plume_overlay.queue_redraw()
 	if head_contour_overlay != null:
 		head_contour_overlay.queue_redraw()
+
+## Pushes the current dispersivity_longitudinal_m/dispersivity_transverse_m
+## exports into the running GridModel, same live-tuning reason as
+## _refresh_geology_parameters/_refresh_well. No head-field redraw needed --
+## GridModel.set_dispersivity() never touches heads (see that function's doc
+## comment) -- only PlumeOverlay's concentration cloud can change from this.
+func _refresh_dispersivity() -> void:
+	if _model == null:
+		return
+	_model.set_dispersivity(dispersivity_longitudinal_m, dispersivity_transverse_m)
+	if plume_overlay != null:
+		plume_overlay.queue_redraw()
 
 ## Pushes RainController.intensity into every rain-reactive visual, once per
 ## frame, since intensity changes continuously while fading in/out (not just
@@ -1305,15 +1361,41 @@ func _add_sandbox_features() -> void:
 		if placement == null or placement.texture == null:
 			continue
 		var tex: Texture2D = placement.texture
+		var footprint_shift := _footprint_anchor_shift(placement.axial, placement.footprint_offsets)
 		var root: Node2D
 		if placement.is_tree:
-			var anchor := Vector2(tex.get_width() / 2.0, tex.get_height()) # bottom-center, same as a procedural tree
+			var anchor := Vector2(tex.get_width() / 2.0, tex.get_height()) - footprint_shift # bottom-center, same as a procedural tree
 			root = _add_tree_feature(placement.axial, tex, anchor, placement.nudge)
 		else:
-			var anchor := Vector2(tex.get_width() / 2.0, tex.get_height() / 2.0) # geometric center, same as a procedural rock/decal
+			var anchor := Vector2(tex.get_width() / 2.0, tex.get_height() / 2.0) - footprint_shift # geometric center, same as a procedural rock/decal
 			root = _add_feature(placement.axial, tex, anchor, placement.nudge)
 		root.name = "SandboxFeature" # display only -- Godot uniquifies sibling names, don't match on this
 		root.set_meta("kind", "feature")
+
+## User's 2026-11-10 ask: "larger terrain features" (e.g. a farm/wetland
+## composite spanning several hex cells, like a diamond of 4 -- see
+## FeaturePlacement.footprint_offsets' own doc comment for the full
+## reasoning). Returns the on-screen pixel vector from `axial`'s own ground
+## point to the footprint's centroid (the average position of axial plus
+## every offset cell) -- ZERO when footprint_offsets is empty, so every
+## existing single-tile placement (sandbox or procedural) is unaffected.
+## Subtracting this from the usual center/bottom-center anchor is what lets a
+## texture drawn centered on that centroid land correctly even though
+## `axial` itself isn't at the image's own geometric center.
+##
+## Deliberately computed from REAL cell_centre_in_features positions, not a
+## separate HexMath pixel formula -- this project's actual on-screen
+## positions come from Godot's own TileMapLayer (ground.map_to_local), and
+## reusing that directly means this can never silently drift out of sync
+## with it the way re-deriving the same geometry a second way could.
+func _footprint_anchor_shift(axial: Vector2i, footprint_offsets: Array[Vector2i]) -> Vector2:
+	if footprint_offsets.is_empty():
+		return Vector2.ZERO
+	var base := cell_centre_in_features(axial)
+	var total := Vector2.ZERO
+	for offset in footprint_offsets:
+		total += cell_centre_in_features(axial + offset) - base
+	return total / float(footprint_offsets.size() + 1) # +1 counts axial's own (zero) delta in the average
 
 ## The fixed source, the player's one capture well (brief SS8 Phase 1 step 7),
 ## and the receptor target (step 8) -- placed dead-center on their cells (no
@@ -1469,6 +1551,8 @@ func cell_info(axial: Vector2i) -> Dictionary:
 		"k_m_s": _model.get_k(axial),
 		"porosity": _model.get_porosity(axial),
 		"diffusion_m2_s": _model.get_diffusion_m2_s(axial),
+		"kd_m3_kg": _model.get_kd_m3_kg(axial),
+		"retardation_factor": _model.get_retardation_factor(axial),
 		"head_m": _model.get_head(axial),
 		"concentration_kg_m3": concentration,
 		"contamination_percent": contamination_percent,

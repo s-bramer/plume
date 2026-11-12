@@ -2,11 +2,53 @@
 
 > Working project specification for Claude Code. Treat this as the source of truth for the initial Godot prototype, not a request to implement every feature immediately.
 
+## 0. Status at a glance (living — keep this in sync as we build)
+
+> Claude Code: update the checkboxes, **Up next**, and **Last updated** line below whenever a roadmap item, gate, or Phase 1 step changes status, alongside the matching `docs/DECISIONS.md` entry (SS10 item 8). This section exists so the status of the project is visible at a glance without reading the whole brief or the full decision log.
+
+**Last updated:** 2026-11-05 (Gate D, first half — equilibrium sorption/retardation complete)
+
+### Phase 1 — gray-box playable prototype (SS8)
+
+- [x] 1. Godot version/scene tree/TileSet confirmed
+- [x] 2. Hex map with click/hover and coordinate conversion
+- [x] 3. Data-backed cells (K, porosity, elevation, head); geology/head visualization
+- [x] 4. Uniform-K benchmark + heterogeneous-K steady-state head solve (Gate A)
+- [x] 5. Seeded contaminant mass; conservative advection-only transport (Gate B)
+- [x] 6. Next Turn, turn counter, concentration overlay, mass-balance display, reset
+- [x] 7. One player engineering action (capture well) + one autonomous contamination behavior (continuing leak)
+- [x] 8. Receptor target, win/loss rules, on-screen turn explanation
+- [x] 9. Tests: zero-gradient, uniform gradient, conservation, nonnegative mass, boundary handling
+
+**Phase 1 is functionally complete.** Remaining physics work deepens it (gates C/D/E/F) rather than adding missing Phase 1 structure.
+
+### Milestone gates (SS12.6)
+
+- [x] **Gate A — verified flow:** uniform-K benchmark + heterogeneous-K head solver
+- [x] **Gate B — verified transport:** conservative advection, stable substeps, mass accounting
+- [x] **Gate C — physical plume:** molecular diffusion + anisotropic mechanical dispersion (complete 2026-10-30)
+- [~] **Gate D — reactive transport:** equilibrium sorption/retardation complete (2026-11-05); kinetic sorption/desorption and biodegradation/reactions not yet started
+- [ ] **Gate E — coupled scenarios:** recharge, pumping, river boundaries, monitoring, remediation
+- [ ] **Gate F — vertical/advanced:** 3–5 layers, cross-sections, matrix diffusion, multiphase
+
+### Beyond the core physics gates
+
+- [x] Sandbox level-editing toggle + data-driven `sandbox_features`/`FeaturePlacement`
+- [x] Weather/atmosphere layers (rainfall events, cloud shadows, ambient mood lighting, shoreline ripples, water shimmer, animated flow arrows)
+- [x] X-ray UI overlays (geology/head/flux/concentration toggles, SS12.5)
+- [ ] Budget-constrained monitoring (currently the whole map's concentration is always visible for free)
+- [ ] Multi-level save/load workflow (see `docs/BACKLOG.md`)
+- [ ] Phase 2 items beyond Gate D: recharge, pumping beyond the single capture well, river boundaries, scenario configuration
+
+**Up next:** either Gate D's second half (biodegradation/decay, brief SS12.4 test 8) or a budget-constrained monitoring-well mechanic — not yet decided; check the most recent `docs/DECISIONS.md` entry for the live discussion.
+
 ## 1. Elevator pitch
 
-**Plume: Darcy's Curse** is a turn-based, 2D pixel-art strategy/puzzle game where the player embodies a groundwater contaminant plume. The plume migrates according to geology, groundwater hydraulics and contaminant chemistry. The player makes constrained strategic choices while an environmental-engineering opponent attempts to investigate, contain and remediate the contamination.
+**Plume: Darcy's Curse** is a turn-based, 2D pixel-art strategy/puzzle game where the player acts as a groundwater engineer, racing to characterize, contain and remediate a migrating contaminant plume before it reaches a sensitive receptor. The plume itself migrates according to geology, groundwater hydraulics and contaminant chemistry, driven by the scenario's physics and source behavior (e.g. a continuing leak) rather than by direct player control — it is the adversary, not the avatar. The player makes constrained strategic choices about monitoring, pumping, barriers and other defensible interventions within a budget and time limit.
 
 **Design pillar:** *Physics creates the puzzle.* Players should learn hydrogeology through visible cause and effect, rather than through quizzes or arbitrary movement powers.
+
+*(Revision, 2026-10-30: earlier drafts of this brief had the player embodying the contaminant plume itself, with an AI "engineer opponent" responding to it. That framing is dropped — the player always plays the engineer. A later, optional adversarial mode where a second player/AI makes contaminant-side scenario choices, e.g. source timing, remains possible — see SS5 — but is not the core game. See `docs/DECISIONS.md`'s 2026-10-30 entry.)*
 
 ## 2. Audience and experience
 
@@ -18,14 +60,14 @@
 ## 3. Gameplay loop
 
 1. **Inspect:** View geological units, hydraulic heads/gradients, contaminant distribution and vulnerable receptors.
-2. **Plan:** Choose one limited plume-side action or strategy (e.g. exploit a pathway, time a release from a sorbed reservoir, or select a source release schedule where scenario rules permit). Actions must respect the contaminant's actual properties and environmental conditions.
+2. **Plan:** Choose a limited set of engineering actions within budget -- e.g. site a monitoring or pump-and-treat well, place a permeable reactive barrier, or adjust bioremediation conditions -- each respecting its own real capacity, residence-time and cost constraints.
 3. **Hydraulic update:** Rainfall/recharge, pumping, boundary conditions and geological heterogeneity determine heads and intercell water fluxes.
-4. **Transport/reactions:** Mass migrates by advection/dispersion and may sorb, desorb, degrade or transform according to the scenario.
-5. **Engineer response:** AI (later potentially another player) investigates and deploys monitoring, pumping or treatment within a budget.
+4. **Transport/reactions:** Mass migrates by advection/dispersion and may sorb, desorb, degrade or transform according to the scenario -- driven by the scenario's own physics and source behavior (e.g. a continuing leak), never by player input.
+5. **Contamination behavior:** The source/scenario may add new stress (a continuing leak, a scripted event, or -- later -- an adversarial choice from a second player/AI); the plume responds to the player's interventions exactly as the physics dictates. There is no separate "contaminant player" turn in the core game.
 6. **Feedback:** Animate the plume and update mass balance, concentration map, flow arrows, objectives and a brief explanation of *why* it moved.
 7. **Repeat** until the receptor-risk or remediation objective is resolved.
 
-The player **does not steer contamination freely** or magically change intrinsic chemical properties. Strategic actions should modify physically defensible controls or choose among feasible pathways. For the first prototype, a temporary 'boost flow' mechanic can be used to test fun, but should ultimately be replaced by a defensible scenario action (e.g. changing a permitted source-release rate or exploiting an existing pumping/recharge event).
+The player **does not control the contaminant** and cannot change its intrinsic properties (solubility, density, sorption coefficients) at will. Strategic actions are limited to physically defensible engineering interventions, each constrained by budget, capacity, residence time or regulatory limits — never an arbitrary "speed up/slow down the plume" lever. For the first prototype, a temporary shortcut (e.g. an uncapped pumping rate) can be used to test fun, but should ultimately be replaced by a defensible, budget/capacity-constrained version of the same action.
 
 ## 4. Core systems
 
@@ -85,6 +127,8 @@ Hydraulic head is a dynamic state variable, not an immutable geological property
 
 ### Engineer defenses
 
+This is the player's own toolkit (not an AI opponent's), exercised within whatever budget and turn limit the scenario sets.
+
 - Monitoring wells: reveal concentrations at selected locations/depths.
 - Pump-and-treat wells: alter hydraulic gradients and extract dissolved mass; capacity/cost constraints.
 - Permeable reactive barriers: allow flow while reacting with appropriate contaminants, subject to residence time and capacity.
@@ -96,10 +140,10 @@ Hydraulic head is a dynamic state variable, not an immutable geological property
 
 ## 5. Objectives and strategy
 
-- Pollutant objective: reach a sensitive receptor (drinking-water supply, river, wetland) above a defined concentration/exposure threshold within a turn limit.
-- Engineer objective: protect receptors and reduce/control the plume within budget and time constraints.
+- Player (engineer) objective: protect receptors and reduce/control the plume within budget and time constraints.
+- Loss condition: the plume reaches a sensitive receptor (drinking-water supply, river, wetland) above a defined concentration/exposure threshold within the turn limit -- the contamination "wins" by default if the player's interventions aren't enough; there is no separate pollutant-side player in the core game.
 - Scoring: receptor risk, remediation cost, elapsed time, remaining mass, and scientific explanation/learning achievements.
-- Later: asymmetric local multiplayer, scenario campaigns and optional 'engineer mode'.
+- Later: asymmetric local multiplayer (one player as engineer, another choosing among contaminant-side scenario options such as source timing), scenario campaigns, and an optional competitive "contaminant mode" -- the core game is always played as the engineer.
 
 ## 6. Visual direction and UX
 
@@ -163,7 +207,7 @@ Keep the architecture modest until the first playable build. Use typed GDScript 
 4. Validate face fluxes with a uniform-`K` linear-head benchmark; when introducing heterogeneous `K`, solve a conservative steady-state head balance with specified boundary conditions.
 5. Seed a finite contaminant mass in one or more cells; implement conservative, one-layer, advection-only transport.
 6. Add Next Turn (Space), turn counter, concentration overlay, mass-balance display and reset.
-7. Add one physically defensible player choice and one simple engineer response (e.g. a capture well with specified pumping rate).
+7. Add one physically defensible engineering action the player controls (e.g. a capture well with specified pumping rate) and one autonomous contamination behavior that keeps threatening the receptor without player input (e.g. a continuing release from the source).
 8. Add a receptor target, win/loss rules and a short on-screen explanation of each turn.
 9. Write tests for zero-gradient transport, uniform gradient direction, mass conservation, nonnegative concentrations and boundary handling.
 
@@ -171,7 +215,7 @@ Keep the architecture modest until the first playable build. Use typed GDScript 
 
 ### Phase 2 — Scientific depth and strategy
 
-- Heterogeneous geology; solved steady-state heads; recharge and pumping; longitudinal/transverse dispersion and molecular diffusion; sorption; simple reactions; monitoring and PRBs; scenario configuration; AI response.
+- Heterogeneous geology; solved steady-state heads; recharge and pumping; longitudinal/transverse dispersion and molecular diffusion; sorption; simple reactions; monitoring and PRBs; scenario configuration; optional AI-driven contaminant-side scenario behavior (the later adversarial mode from SS5, not required for the core single-player loop).
 - Validate against simple analytical or benchmark cases before balancing for fun.
 
 ### Phase 3 — Vertical hydrogeology and presentation
@@ -210,6 +254,7 @@ When working in this repository:
 7. Use deterministic test scenarios and check mass balance at every step.
 8. Keep a brief `docs/DECISIONS.md` record of consequential design/science simplifications.
 9. After each change, state what changed, how to test it in Godot and the next small task.
+10. Keep SS0 ("Status at a glance") up to date: check off roadmap/gate items and update "Up next" and "Last updated" whenever their status changes.
 
 **Suggested first prompt:**
 
@@ -265,7 +310,7 @@ Here `C` is dissolved concentration, `D` the hydrodynamic dispersion tensor, `v`
 - For equilibrium sorption, either represent total equilibrium inventory with retardation **or** explicitly track dissolved/sorbed pools; do not apply both independently.
 - Track `M_initial + M_sources = M_aqueous + M_sorbed + M_NAPL + M_extracted + M_exported + M_transformed + residual`, with constituent/species accounting defined consistently.
 - Keep concentration nonnegative, use stability-limited numerical substeps, and report mass-balance error.
-- **Do not use an arbitrary contaminant “speed boost”** as a real physics mechanic. Players can control scenario-authorised source timing or environmental interventions; contaminant intrinsic properties remain fixed.
+- **Do not use an arbitrary contaminant “speed boost”** as a real physics mechanic. Players (always the engineer) do not control the source or its timing -- that is an autonomous scenario parameter (e.g. a continuing leak, or a later scripted/adversarial event); players act only through defensible engineering interventions within budget and physical limits. Contaminant intrinsic properties remain fixed regardless.
 
 ### 12.4 Numerical verification before expanding features
 

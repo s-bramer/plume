@@ -2707,3 +2707,214 @@ const are not in tension; keeping both is strictly more robust than either alone
 
 Verified: 386/386 tests pass (cold, cache deleted); clean `--headless --quit` boot; clean
 `--headless --editor res://scenes/main.tscn --quit` boot.
+
+## 2026-10-30 — Reverted: player plume-side action. Brief corrected: player is always the engineer
+
+Briefly added, then reverted same-session: `_trigger_player_release()`, a budgeted "release pulse" (R key /
+HUD button) adding fixed mass at `source_axial`, read from Phase 1 step 7's "one physically defensible
+player choice" as a still-missing thing separate from the capture well.
+
+**User correction**: `PLUME_PROJECT_BRIEF.md` still described an earlier concept -- the player embodying the
+contaminant plume itself, with an AI "engineer opponent" responding to it (SS1, SS3's "plume-side action",
+SS5's "Engineer objective" vs. "Pollutant objective"). That framing was superseded by agreement earlier in
+this project's life (player is the groundwater engineer, full stop), but the brief document itself was never
+updated to say so -- it still read as if a "plume-side player choice," separate from the engineer's own
+actions, was something Phase 1 step 7 required. Reading it that way is exactly what produced
+`_trigger_player_release()`: a mechanic that invents mass at the source with no in-fiction grounding, which
+is uncomfortably close to the brief's own guardrail #1 ("never let the player change... without an explicit,
+scientifically meaningful mechanism") even though it never touched K/head/sorption directly.
+
+**Brief updated** (SS1, SS3, SS4's "Engineer defenses", SS5, SS8 step 7, SS12.3) to consistently say: the
+player is always the groundwater engineer; the contamination is driven by the scenario's own physics and
+source behavior (a continuing leak, later possibly a scripted/adversarial event), never by a player-side
+"plume" turn. An asymmetric contaminant-controlling mode remains a possible LATER addition (SS5), not the
+core game.
+
+**Net effect on Phase 1 step 7, under the corrected reading**: it was already satisfied. "One physically
+defensible engineering action the player controls" = the capture well (`well_axial`/`well_pumping_rate_m3_s`,
+2026-10-20). "One autonomous contamination behavior that keeps threatening the receptor without player
+input" = the continuing source leak (`source_leak_rate_kg_s`, same date). No new mechanic was actually
+needed here -- the gap was in the brief's wording, not in the implementation.
+
+Reverted cleanly (this session's own edits, not a git operation): the two new exports
+(`player_release_pulse_kg`, `player_release_budget`), `_trigger_player_release()`, the HUD label/button, the
+`R`-key binding, the `_seed_initial_contamination()` budget-reset line, and `_test_world_player_release_action`
+in `tests/run_tests.gd`, plus this file's and `docs/SIMULATION_ASSUMPTIONS.md`'s now-inapplicable entries
+about it.
+
+Verified: 386/386 tests pass (back to the pre-feature count); clean `--headless --quit` boot; clean
+`--headless --editor res://scenes/main.tscn --quit` boot.
+
+## 2026-10-30 — Gate C complete: mechanical dispersion
+
+Brief SS12.6 Gate C: "effective molecular diffusion and anisotropic longitudinal/transverse dispersion."
+Molecular diffusion landed 2026-10-21; this closes the gate's remaining half.
+
+**Governing equations (brief SS12.2/SS12.3)**: `D_L = alpha_L*|v| + D_m_effective`, `D_T = alpha_T*|v| +
+D_m_effective`, with the combined tensor projected onto each face's own normal direction via
+`D_normal = D_T + (D_L - D_T) * cos(theta)^2` ("Use a tensor and face-normal projection for general flow
+directions"). Implemented as a term ADDED alongside molecular diffusion's existing conductance rather than a
+merged formula -- `D_m_effective` is already `_face_diffusion_conductance_m3_s`'s whole job, so the new
+`_face_dispersion_conductance_m3_s` carries only the velocity-dependent `alpha_L*|v|`/`alpha_T*|v|` part. The
+two are physically equivalent to the brief's combined formula (dispersion = molecular + mechanical, simply
+added) and correctly collapse to diffusion-only behavior at zero velocity, without needing D_L/D_T to equal
+D_m_effective as a special case of one unified function.
+
+**The hard part: knowing the LOCAL FLOW DIRECTION, not just one face's flux.** Dispersion is anisotropic
+relative to the flow direction, which generally doesn't align with any single face's own normal on a hex
+grid. `GridModel._cell_velocity_vector_m_s()` reconstructs a per-cell 2D velocity vector from all six face
+fluxes: `v = (1/3) * sum(q_face * n_hat_face) / n_e`. This is EXACT for a locally uniform flow field -- a
+flat-top hex's 6 neighbor directions are always evenly spaced 60 degrees apart, and for N evenly-spaced unit
+vectors in 2D, `sum(n_hat (x) n_hat) = (N/2)*I`; here N=6, so dividing by 3 recovers the true flux vector
+whenever all six faces agree with one uniform vector, and is a reasonable least-squares estimate otherwise.
+A missing neighbor (map edge) contributes nothing -- the SAME no-flow-by-omission convention `_solve_heads()`
+already uses, not a new approximation. The direction vectors themselves (`GridModel._direction_unit_vectors`)
+reuse `HexMath.axial_to_pixel`'s own flat-top geometry (already preloaded for `cells_in_radius`/`neighbors`)
+rather than re-deriving the same angles independently, so simulation and rendering can never silently drift
+apart if the hex orientation convention is ever revisited again.
+
+A face's representative velocity is the AVERAGE of its two cells' reconstructed vectors -- dispersion is a
+property of the bulk flow carrying a parcel of water past a face, not of that one face's own flux in
+isolation. Velocity vectors are computed once per `step_transport()`/`max_stable_dt_s()` call
+(`_all_cell_velocity_vectors_m_s()`), not redundantly inside the per-face loop.
+
+**`dispersivity_longitudinal_m`/`dispersivity_transverse_m`** (`World` exports, defaults 10.0 m / 1.0 m):
+deliberately a SINGLE scenario-wide pair, not a per-geology table like K/porosity/diffusion. Real dispersivity
+is primarily scale-dependent (how far/heterogeneously a plume has traveled), not a clean function of
+lithology the way K is -- the brief's own caveat says so directly ("Dispersivity is scale dependent"), so a
+per-geology lookup would have implied a precision this project doesn't have grounds for. The 10:1
+longitudinal:transverse ratio is the commonly cited rule of thumb for a conservative tracer (e.g. Gelhar et
+al.). Live-tunable via `GridModel.set_dispersivity()`, which deliberately does NOT re-solve heads (unlike
+`apply_geology_parameters`/`set_well`) -- dispersivity has zero effect on the flow field, only on how
+transport spreads mass through it.
+
+**Scope, same as molecular diffusion**: interior cell-to-cell faces only; the open south boundary and the
+capture well do not disperse (same deferred-boundary-concentration reasoning already documented for
+diffusion).
+
+Tests added (brief SS12.4 test 6, "elongation follows flow direction and broadening follows transverse
+dispersivity"): `_test_grid_model_dispersion_tensor_projection` calls `_face_dispersion_conductance_m3_s`
+directly with a hand-constructed velocity vector EXACTLY parallel (must equal `alpha_L*|v|` exactly) and
+EXACTLY perpendicular (must equal `alpha_T*|v|` exactly) to a face's own normal -- bypassing the hex grid's
+own 6 discrete directions (none of which is exactly 90 degrees from another) to test the tensor-projection
+formula at its two exact endpoints, plus a relative check that aligned > perpendicular, and that zero velocity
+gives zero dispersion regardless of dispersivity. `_test_grid_model_dispersion_inactive_at_zero_velocity`
+confirms this end-to-end through a real `step_transport()` call (flat head field, molecular diffusion zeroed
+out, huge dispersivity, zero mass moves). `_test_grid_model_dispersion_included_in_cfl_bound` mirrors the
+existing diffusion/well/K stability-bound tests.
+
+Verified: 392 PASS, 0 FAIL/SCRIPT ERROR; clean `--headless --quit` boot; clean
+`--headless --editor res://scenes/main.tscn --quit` boot.
+
+## 2026-11-05 — Added SS0 "Status at a glance" to `PLUME_PROJECT_BRIEF.md`
+
+Added a new living section at the very top of the brief: checkboxes for all 9 Phase 1 roadmap steps, all 6
+milestone gates (SS12.6), and a "beyond the core physics gates" list (sandbox editing, weather/atmosphere,
+X-ray overlays, done; budget-constrained monitoring, multi-level save/load, and Phase 2 recharge/pumping/river
+items, not yet done), plus an "Up next" line and a "Last updated" date. Added a new rule to SS10 (item 10):
+keep SS0 in sync whenever a roadmap/gate item's status changes, alongside the existing DECISIONS.md rule
+(item 8) -- the brief is now the fast at-a-glance view, this file remains the detailed *why*.
+
+Reasoning while filling it in: confirmed Phase 1 step 8 (receptor target + win/loss rules) is actually done by
+grepping `world.gd` for `receptor_axial`/win-loss logic before checking it off, rather than assuming from
+memory -- it is (`_check_win_loss_state`, `receptor_contamination_threshold_kg_m3`, etc., all present).
+
+## 2026-11-05 — Gate D (first half): equilibrium sorption / retardation
+
+Implemented linear equilibrium sorption (brief SS12.2/SS12.3/SS12.6 Gate D), using the SIMPLER of the brief's
+own two sanctioned options -- "represent total equilibrium inventory with retardation" rather than explicitly
+tracking separate dissolved/sorbed mass pools (the brief's own text: "do not apply both independently").
+
+**The key realization that made this a small change, not a big one**: `mass_kg` per cell was already the
+TOTAL contaminant inventory (it never distinguished dissolved from sorbed -- there was no sorption yet, so the
+distinction didn't exist). For linear equilibrium sorption (`S = Kd*C`), the algebra works out to
+`M_total = R_f * C * V_pore` where `R_f = 1 + rho_b*Kd/n_e` (full derivation in
+`GridModel.retardation_factor`'s own doc comment). That means `get_concentration_kg_m3()` just needed one
+extra division, by `R_f`, to turn the existing "total mass / pore volume" into "AQUEOUS mass / pore volume".
+Every existing transport term (advection, diffusion, dispersion, well capture, south-boundary escape) already
+computes its transfer by multiplying `get_concentration_kg_m3()` by a face/sink conductance -- none of those
+formulas needed to change at all. Retardation falls out of the entire existing transport machinery for free,
+and is also why a well correctly only captures the (smaller, retarded) AQUEOUS concentration, not the total
+inventory -- physically correct: sorbed mass sits on the solid matrix, pumping doesn't extract it.
+
+**New parameters** (`GridModel`): `kd_m3_kg` (per-geology, like K/porosity/diffusion -- real Kd genuinely
+depends on sediment type) with defaults sand `2.0e-4`, silt `8.0e-4`, clay `3.0e-3` m3/kg, Inspector-tunable on
+`World` (`sand_kd_m3_kg`/`silt_kd_m3_kg`/`clay_kd_m3_kg`). Bulk density is NOT a second independent table --
+it's derived from each cell's own porosity via `rho_b = PARTICLE_DENSITY_KG_M3 * (1 - n_e)`, with
+`PARTICLE_DENSITY_KG_M3 = 2650.0` kg/m3 as a single geology-INDEPENDENT constant (grain density is roughly
+uniform across these units; porosity -- already a per-geology table -- is what actually differs). Resulting
+retardation factors with default values: sand ~2.2x, silt ~7.4x, clay ~59x. Clay's large number is consistent
+with this project's already-established "make clay's contrast dramatic on purpose" pattern (6000x K contrast),
+not a new exaggeration invented here.
+
+**CFL stability bound**: retardation only ever RELAXES `max_stable_dt_s()` (a more-retarded cell's total
+inventory drains slower, so a larger step stays stable for it) -- implemented as a single `* get_retardation_
+factor(axial)` multiply at the point the bound divides pore volume by total outflow, rather than threading
+`R_f` through every individual outflow-accumulator term.
+
+**Two existing tests needed updating, not just new ones added**: `_test_grid_model_concentration` and
+`_test_plume_overlay_fraction` both hand-computed "mass / pore volume" or hand-set `mass_kg` to hit a target
+concentration, assuming no retardation -- both broke the moment Gate D's nonzero default Kd table went live
+(a cell's concentration is now genuinely smaller than mass/volume), and both were fixed by folding
+`get_retardation_factor()` into their own expected-value math, not by disabling or weakening the check.
+
+**Scope**: equilibrium sorption only. Kinetic (rate-limited) sorption/desorption -- which needs a genuine
+separate dissolved/sorbed pool, since it can no longer assume instantaneous equilibrium -- and
+biodegradation/reactions (Gate D's other half) remain unimplemented.
+
+New tests: `_test_grid_model_retardation_factor_formula` (R_f and bulk density match their formulas exactly),
+`_test_grid_model_dissolved_sorbed_mass_split` (the derived dissolved/sorbed getters always reconstruct the
+total, never invent or lose mass), `_test_grid_model_retardation_delays_transport` (brief SS12.4 test 7,
+"breakthrough delayed by expected factor": a homogeneous-aquifer model with R_f=3 transfers EXACTLY 1/3 as
+much mass in one identical transport step as an R_f=1 baseline sharing the same solved flow field). Also added
+`kd_m3_kg`/`retardation_factor` to `World.cell_info()` and the on-screen cell inspector, alongside the
+existing K/porosity/diffusion fields.
+
+Verified: 405 PASS, 0 FAIL/SCRIPT ERROR; clean `--headless --quit` boot; clean
+`--headless --editor res://scenes/main.tscn --quit` boot.
+
+## 2026-11-10 — Multi-cell sandbox features (`FeaturePlacement.footprint_offsets`)
+
+User's ask: larger terrain features for sandbox levels (e.g. a farm or wetland) drawn as ONE composite image
+that visually spans several hex cells -- their first draft, `art/pretty_tiles/tiles/receptor_farm.png`, is a
+symmetric diamond of 4 hexes (a top hex, its lower-left and lower-right neighbors side by side, and a bottom
+hex straight below them).
+
+**This needed no new placement system** -- `World._add_feature`'s anchor+nudge mechanism was already
+completely size-agnostic (confirmed by this project's own existing oversized art, `mountain_large.png` and
+`receptor_lake.png`, both already bigger than one tile and already anchored this same way). The one genuine
+gap: for a symmetric multi-cell composite, the texture's own bounding-box center (today's automatic anchor for
+any non-tree feature) is usually NOT the pixel that should land on the placement's own cell -- it should land
+on the FOOTPRINT's centroid instead, and hand-computing that pixel offset by trial and error would be tedious
+and error-prone for a large image, exactly the "don't iterate blindly on visual tuning" trap this project
+already avoids elsewhere by exposing a tunable instead.
+
+**Fix**: `FeaturePlacement` gained `footprint_offsets: Array[Vector2i]` -- the OTHER cells (relative to
+`axial`) the texture covers; empty (the default) leaves every existing sandbox_features entry completely
+unaffected. `World._footprint_anchor_shift(axial, footprint_offsets)` computes the real on-screen pixel vector
+from `axial` to the footprint's centroid using `cell_centre_in_features` directly (the same positions
+Godot's own TileMapLayer already places everything against), NOT a separate HexMath pixel formula -- re-deriving
+hex geometry a second way risked silently drifting out of sync with this project's actual rendering positions
+(unlike `HexMath.axial_to_pixel`, which is only ever used for pure DIRECTION vectors elsewhere, e.g.
+`flow_overlay.gd`, never for absolute on-screen pixel distances). `_add_sandbox_features` subtracts this shift
+from the usual center/bottom-center anchor before `nudge`'s own fine pixel polish is added on top, so the
+coarse placement is exact/computed and `nudge` stays what it always was -- a few pixels of final adjustment,
+not the entire positioning job.
+
+**Still needed from the user before this is usable**: `receptor_farm.png` is an untrimmed draft canvas
+(1844x853px, confirmed via its PNG header) with large transparent margins -- nowhere near this project's actual
+tile scale (122x106px/hex). It needs cropping close to its real silhouette before `nudge`'s remaining fine
+adjustment is practical to eyeball. Once cropped, add a `sandbox_features` entry with `axial` = whichever hex
+of the diamond should be the "logical" placement cell (recommend the BOTTOM hex -- matches this project's
+existing Y-sort convention of anchoring a feature's ground-contact point at its frontmost/southernmost point,
+same reasoning `_add_tree_feature`'s bottom-center anchor already uses) and `footprint_offsets` = the other 3
+hexes' offsets from that cell.
+
+New tests: `_test_world_footprint_anchor_shift` (the empty case is exactly zero; a single-offset and the real
+4-hex diamond both match a from-scratch recomputation via `cell_centre_in_features`, not a hardcoded pixel
+number; the diamond's centroid has zero horizontal offset, a real geometric property of that symmetric shape)
+and `_test_world_sandbox_feature_with_footprint` (end-to-end: a placed sprite's actual `offset` reflects the
+shift on top of the usual anchor and `nudge`).
+
+Verified: 411 PASS, 0 FAIL/SCRIPT ERROR; clean `--headless --quit` boot; clean
+`--headless --editor res://scenes/main.tscn --quit` boot.
